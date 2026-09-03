@@ -1,6 +1,11 @@
 #!/bin/bash
 # ============================================================================
-# mhc_pre_sinkhorn 一键运行脚本（编译/上板精度/仿真/上板性能）
+# mhc_pre_sinkhorn 一键运行脚本（编译/上板精度/仿真/上板性能）— 环境无关版
+#
+# 自动适配三种运行环境 (与 hc_pre/run.sh 相同的探测逻辑):
+#   A. 裸机/容器内直接运行: 路径取脚本实际位置, 全部本地执行
+#   B. WSL + docker: 检测 docker 可用性, 自动同步代码进容器
+#   C. 远程 A3 容器 (工程整体拷入): 同 A
 #
 # 用法:
 #   bash run.sh build  [--debug|--release]        # 编译+安装算子包+编译 example(默认 release)
@@ -13,7 +18,7 @@
 #   MHCS_B / MHCS_BS    等效位置参数 (默认 b=1, bs=2)
 #   MHCS_MODE           debug|release
 #   MHCS_SIM_TIMEOUT_MIN 仿真超时分钟 (默认 30)
-#   CONTAINER           容器名 (默认 cann_container; 裸机 A3 设 CONTAINER=none)
+#   CONTAINER           强制指定容器名; 设 CONTAINER=none 强制本地; 未设置时自动探测
 #
 # 备注:
 #   - 随机种子固定 1024; golden dump 的输入 bin 与上板/仿真共用
@@ -22,80 +27,85 @@
 # ============================================================================
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-C=${CONTAINER:-cann_container}
-WS=/root/HcPre
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+WS="$(cd "$SCRIPT_DIR/../.." && pwd)"
+
+detect_mode() {
+  if [ -n "${CONTAINER:-}" ]; then
+    echo "${CONTAINER}"
+    return
+  fi
+  command -v docker >/dev/null 2>&1 || { echo none; return; }
+  local def=${CANN_CONTAINER:-cann_container}
+  docker inspect "$def" >/dev/null 2>&1 || { echo none; return; }
+  echo "$def"
+}
+C=$(detect_mode)
+
 REPO=$WS/ops-transformer
-ENVSH=$WS/scripts/container_env.sh
-INSTALL_DIR=$WS/mhc_pre_install
-VENDOR_DIR=$INSTALL_DIR/vendors/custom_transformer
 BUILD_SOC=${MHCS_BUILD_SOC:-ascend910_93}
 SIM_SOC=${MHCS_SIM_SOC:-Ascend910_9382}
 MODE=${MHCS_MODE:-release}
 B=${MHCS_B:-1}
 BS=${MHCS_BS:-2}
-EXE=$REPO/build/test_aclnn_mhc_pre_sinkhorn_hcshape
-IN_BIN=$WS/mhcs_input_run.bin
-OUT_BIN=$WS/mhcs_output_run.bin
 
 step() { echo -e "\n===== [mhcs.run] $* ====="; }
 die()  { echo "ERROR: $*" >&2; exit 1; }
 
-if [ "$C" = "none" ]; then
-  run()  { bash -c "$*"; }
-  runi() { bash -s; }
-  WS=${HCPRE_HOME:-$HOME/HcPre}
-  REPO=$WS/ops-transformer
-  ENVSH=$WS/scripts/container_env.sh
-  INSTALL_DIR=$WS/mhc_pre_install
-  VENDOR_DIR=$INSTALL_DIR/vendors/custom_transformer
-  EXE=$REPO/build/test_aclnn_mhc_pre_sinkhorn_hcshape
-else
-  docker start "$C" >/dev/null 2>&1 || true
-  run()  { docker exec "$C" bash -c "$*"; }
-  runi() { docker exec -i "$C" bash -s; }
-fi
+xec() {
+  if [ "$C" = "none" ]; then
+    bash -s
+  else
+    docker exec -i "$C" bash -s
+  fi
+}
 
-TOTAL_BS=$(( B * BS ))   # recomputed in main after arg parsing; kept for early defaults
+# 容器内工程路径 (docker 模式固定 /root/HcPre; 本地模式 = 实际脚本位置)
+lws()  { [ "$C" = "none" ] && echo "$WS" || echo /root/HcPre; }
+
+TOTAL_BS=$(( B * BS ))
 
 # ---------------------------------------------------------------------------
 # 生成输入 bin + golden 参考 (4 元头: b, bs, n, d)
 # ---------------------------------------------------------------------------
 gen_inputs() {
-  runi <<EOS
+  local LWS; LWS=$(lws)
+  xec <<EOS
 set -e
-export PATH=/usr/local/python3.11.15/bin:\$PATH 2>/dev/null || true
 export TORCH_DEVICE_BACKEND_AUTOLOAD=0
-MHCS_GOLDEN_BATCH=$B MHCS_GOLDEN_SIZE=$BS python3 $WS/scripts/mhc_pre_sinkhorn/run_golden.py \\
-  --dump-input $IN_BIN --save $WS/golden_refs/mhcs_golden_b${B}_bs${BS}.pt 2>&1 | grep -E "golden.*(dumped|saved|outputs)"
+MHCS_GOLDEN_BATCH=$B MHCS_GOLDEN_SIZE=$BS python3 $LWS/scripts/mhc_pre_sinkhorn/run_golden.py \\
+  --dump-input $LWS/mhcs_input_run.bin --save $LWS/golden_refs/mhcs_golden_b${B}_bs${BS}.pt 2>&1 | grep -E "golden.*(dumped|saved|outputs)"
 EOS
 }
 
 # ---------------------------------------------------------------------------
-# 1. build: 编译算子包(debug/release) + 安装 + 编译 example
+# 1. build
 # ---------------------------------------------------------------------------
 do_build() {
-  step "build mhc_pre_sinkhorn ($MODE, soc=$BUILD_SOC)"
+  step "build mhc_pre_sinkhorn ($MODE, soc=$BUILD_SOC) [mode=$C]"
 
   if [ "$C" != "none" ]; then
     bash "$SCRIPT_DIR/../sync_repo.sh" >/dev/null
   fi
+  [ -d "$REPO" ] || die "repo not found at $REPO"
 
-  # debug/release 由 CMakeLists 的 CMAKE_BUILD_TYPE 条件块控制
-  # (op_host/CMakeLists.txt: ccec_g enabled when CMAKE_BUILD_TYPE STREQUAL "Debug")
+  local LWS LREPO LENVSH LINSTALL LVENDOR LEXE
+  LWS=$(lws); LREPO=$LWS/ops-transformer; LENVSH=$LWS/scripts/container_env.sh
+  LINSTALL=$LWS/mhc_pre_install; LVENDOR=$LINSTALL/vendors/custom_transformer
+  LEXE=$LREPO/build/test_aclnn_mhc_pre_sinkhorn_hcshape
+
   BUILD_TYPE_FLAG=""
   [ "$MODE" = "debug" ] && BUILD_TYPE_FLAG="--build-type=Debug"
 
   # 编译算子包
-  runi <<EOS
+  xec <<EOS
 set -e
-source $ENVSH
-cd $REPO
+source $LENVSH
+cd $LREPO
 rm -rf output build_out build/binary build/autogen
-bash $WS/scripts/container_monitor_run.sh $WS/logs/mhcs_op_build.log \\
+bash $LWS/scripts/container_monitor_run.sh $LWS/logs/mhcs_op_build.log \\
   bash build.sh --pkg $BUILD_TYPE_FLAG --ops=mhc_pre_sinkhorn --soc=$BUILD_SOC -j\$(nproc) 2>&1 | tail -3 || {
-    tail -40 $WS/logs/mhcs_op_build.log; exit 1; }
-# verify debug info if requested
+    tail -40 $LWS/logs/mhcs_op_build.log; exit 1; }
 if [ "$MODE" = "debug" ]; then
   OBJDUMP=\$ASCEND_HOME_PATH/tools/bisheng_compiler/bin/llvm-objdump
   OBJ=\$(find build/binary/ascend910_93/bin/mhc_pre_sinkhorn -name "*.o" | head -1)
@@ -110,59 +120,61 @@ fi
 EOS
 
   # 安装
-  runi <<EOS
+  xec <<EOS
 set -e
-source $ENVSH
-cd $REPO
-mkdir -p $INSTALL_DIR
+source $LENVSH
+cd $LREPO
+mkdir -p $LINSTALL
 shopt -s nullglob
 installers=(./build/cann-ops-transformer*.run)
 shopt -u nullglob
-[[ \${#installers[@]} -ge 1 ]] || die "no installer"
+[[ \${#installers[@]} -ge 1 ]] || { echo "ERROR: no installer"; exit 1; }
 chmod +x "\${installers[0]}"
-"\${installers[0]}" --install-path=$INSTALL_DIR
-ls $VENDOR_DIR/op_impl/ai_core/tbe/kernel/config/ascend910_93/ | grep mhc
+"\${installers[0]}" --install-path=$LINSTALL
+ls $LVENDOR/op_impl/ai_core/tbe/kernel/config/ascend910_93/ | grep mhc
 EOS
 
   # 编译 example
-  runi <<EOS
+  xec <<EOS
 set -e
-source $ENVSH
-cd $REPO
+source $LENVSH
+cd $LREPO
 mkdir -p build
-CUST_LIB="$VENDOR_DIR/op_api/lib"
-CUST_INC="$VENDOR_DIR/op_api/include/aclnnop"
-COMMON_INC="$REPO/common/include/external"
+CUST_LIB="$LVENDOR/op_api/lib"
+CUST_INC="$LVENDOR/op_api/include/aclnnop"
+COMMON_INC="$LREPO/common/include/external"
 g++ mhc/mhc_pre_sinkhorn/examples/test_aclnn_mhc_pre_sinkhorn_hcshape.cpp \\
   -I \$CUST_INC -I \$COMMON_INC -I \$ASCEND_HOME_PATH/include -I \$ASCEND_HOME_PATH/include/aclnn \\
   -L \$CUST_LIB -L \$ASCEND_HOME_PATH/lib64 \\
   -lopapi_math -lcust_opapi -lascendcl -lnnopbase -lc_sec \\
-  -o $EXE \\
+  -o $LEXE \\
   -Wl,-rpath=\$CUST_LIB
-ls -la $EXE
+ls -la $LEXE
 EOS
   step "build done ($MODE)"
 }
 
 # ---------------------------------------------------------------------------
-# 2. board 精度: example 直跑 + golden 比对
+# 2. board 精度
 # ---------------------------------------------------------------------------
 do_board() {
-  step "board accuracy (b=$B, bs=$BS, total_bs=$TOTAL_BS)"
+  step "board accuracy (b=$B, bs=$BS, total_bs=$TOTAL_BS) [mode=$C]"
+  local LWS LREPO LENVSH LVENDOR LEXE
+  LWS=$(lws); LREPO=$LWS/ops-transformer; LENVSH=$LWS/scripts/container_env.sh
+  LVENDOR=$LWS/mhc_pre_install/vendors/custom_transformer
+  LEXE=$LREPO/build/test_aclnn_mhc_pre_sinkhorn_hcshape
   gen_inputs
-  runi <<EOS
+  xec <<EOS
 set -e
-source $ENVSH
-export ASCEND_CUSTOM_OPP_PATH=$VENDOR_DIR
-$EXE $IN_BIN $OUT_BIN
+source $LENVSH
+export ASCEND_CUSTOM_OPP_PATH=$LVENDOR
+$LEXE $LWS/mhcs_input_run.bin $LWS/mhcs_output_run.bin
 EOS
-  runi <<EOS
+  xec <<EOS
 set -e
-export PATH=/usr/local/python3.11.15/bin:\$PATH 2>/dev/null || true
 export TORCH_DEVICE_BACKEND_AUTOLOAD=0
-# out bin header is flat (bs,n,d); golden compare flattens b too
-MHCS_GOLDEN_BATCH=1 MHCS_GOLDEN_SIZE=$TOTAL_BS python3 $WS/scripts/mhc_pre_sinkhorn/run_golden.py \\
-  --result $OUT_BIN 2>&1 | grep golden
+MHCS_GOLDEN_BATCH=1 MHCS_GOLDEN_SIZE=$TOTAL_BS python3 $LWS/scripts/mhc_pre_sinkhorn/run_golden.py \\
+  --result $LWS/mhcs_output_run.bin 2>&1 | grep golden
 EOS
 }
 
@@ -170,55 +182,58 @@ EOS
 # 3. msprof 仿真
 # ---------------------------------------------------------------------------
 do_sim() {
-  step "msprof simulator (b=$B, bs=$BS)"
+  step "msprof simulator (b=$B, bs=$BS) [mode=$C]"
+  local LWS LREPO LENVSH LVENDOR LEXE
+  LWS=$(lws); LREPO=$LWS/ops-transformer; LENVSH=$LWS/scripts/container_env.sh
+  LVENDOR=$LWS/mhc_pre_install/vendors/custom_transformer
+  LEXE=$LREPO/build/test_aclnn_mhc_pre_sinkhorn_hcshape
   gen_inputs
-  runi <<EOS
+  xec <<EOS
 set -e
-source $ENVSH
-V=$VENDOR_DIR
-export ASCEND_CUSTOM_OPP_PATH=\$V
-export LD_LIBRARY_PATH=\$ASCEND_HOME_PATH/x86_64-linux/simulator/$SIM_SOC/lib:\$V/op_api/lib:\$LD_LIBRARY_PATH
-cp -f $IN_BIN $REPO/build/ 2>/dev/null || true
-cd $REPO/build
-rm -rf $WS/sim_out_mhcs; mkdir -p $WS/sim_out_mhcs
+source $LENVSH
+export ASCEND_CUSTOM_OPP_PATH=$LVENDOR
+export LD_LIBRARY_PATH=\$ASCEND_HOME_PATH/x86_64-linux/simulator/$SIM_SOC/lib:\$LD_LIBRARY_PATH
+rm -rf $LWS/sim_out_mhcs; mkdir -p $LWS/sim_out_mhcs
 msprof op simulator \\
-  --application="$EXE $IN_BIN $OUT_BIN" \\
-  --output=$WS/sim_out_mhcs \\
+  --application="$LEXE $LWS/mhcs_input_run.bin $LWS/mhcs_output_run.bin" \\
+  --output=$LWS/sim_out_mhcs \\
   --kernel-name=MhcPreSinkhorn \\
   --launch-count=1 \\
   --soc-version=$SIM_SOC \\
   --timeout=${MHCS_SIM_TIMEOUT_MIN:-30} || true
 echo "--- sim csv summary ---"
-python3 $WS/scripts/parse_sim_csv.py $WS/sim_out_mhcs 2>/dev/null | head -30 || echo "(no csv)"
+python3 $LWS/scripts/parse_sim_csv.py $LWS/sim_out_mhcs 2>/dev/null | head -30 || echo "(no csv)"
 EOS
-  # 仿真后比对
-  runi <<EOS
+  xec <<EOS
 set -e
-export PATH=/usr/local/python3.11.15/bin:\$PATH 2>/dev/null || true
 export TORCH_DEVICE_BACKEND_AUTOLOAD=0
-[ -f $OUT_BIN ] && MHCS_GOLDEN_BATCH=1 MHCS_GOLDEN_SIZE=$TOTAL_BS \\
-  python3 $WS/scripts/mhc_pre_sinkhorn/run_golden.py --result $OUT_BIN 2>&1 | grep golden || echo "(no output bin to compare)"
+[ -f $LWS/mhcs_output_run.bin ] && MHCS_GOLDEN_BATCH=1 MHCS_GOLDEN_SIZE=$TOTAL_BS \\
+  python3 $LWS/scripts/mhc_pre_sinkhorn/run_golden.py --result $LWS/mhcs_output_run.bin 2>&1 | grep golden || echo "(no output bin to compare)"
 EOS
 }
 
 # ---------------------------------------------------------------------------
-# 4. board 性能: msprof 板端 + Task Duration 统计 + op_summary csv 路径
+# 4. board 性能
 # ---------------------------------------------------------------------------
 do_perf() {
-  step "board performance (msprof, b=$B, bs=$BS)"
+  step "board performance (msprof, b=$B, bs=$BS) [mode=$C]"
+  local LWS LREPO LENVSH LVENDOR LEXE
+  LWS=$(lws); LREPO=$LWS/ops-transformer; LENVSH=$LWS/scripts/container_env.sh
+  LVENDOR=$LWS/mhc_pre_install/vendors/custom_transformer
+  LEXE=$LREPO/build/test_aclnn_mhc_pre_sinkhorn_hcshape
   gen_inputs
-  runi <<EOS
+  xec <<EOS
 set -e
-source $ENVSH
+source $LENVSH
 which msprof >/dev/null 2>&1 || { echo "msprof not found"; exit 1; }
-export ASCEND_CUSTOM_OPP_PATH=$VENDOR_DIR
-rm -rf $WS/perf_out_mhcs; mkdir -p $WS/perf_out_mhcs
-msprof --application="$EXE $IN_BIN $OUT_BIN" \\
-  --output=$WS/perf_out_mhcs 2>&1 | tail -3 || true
+export ASCEND_CUSTOM_OPP_PATH=$LVENDOR
+rm -rf $LWS/perf_out_mhcs; mkdir -p $LWS/perf_out_mhcs
+msprof --application="$LEXE $LWS/mhcs_input_run.bin $LWS/mhcs_output_run.bin" \\
+  --output=$LWS/perf_out_mhcs 2>&1 | tail -3 || true
 echo
 echo "=== op_summary csv ==="
-find $WS/perf_out_mhcs -name "op_summary_*.csv" -exec ls -la {} \; 2>/dev/null || echo "(none)"
-CSV=\$(find $WS/perf_out_mhcs -name "op_summary_*.csv" | head -1)
+find $LWS/perf_out_mhcs -name "op_summary_*.csv" -exec ls -la {} \; 2>/dev/null || echo "(none)"
+CSV=\$(find $LWS/perf_out_mhcs -name "op_summary_*.csv" | head -1)
 if [ -n "\$CSV" ]; then
   echo
   echo "=== Task Duration (us) ==="
@@ -250,7 +265,7 @@ while [ $# -gt 0 ]; do
 done
 B=${POS_B:-$B}
 BS=${POS_BS:-$BS}
-TOTAL_BS=$(( B * BS ))   # recompute after positional args override B/BS
+TOTAL_BS=$(( B * BS ))
 
 case "$CMD" in
   build) do_build ;;
