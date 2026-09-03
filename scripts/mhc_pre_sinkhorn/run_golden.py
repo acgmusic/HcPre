@@ -56,7 +56,8 @@ Y_REQUIRED_PASS_RATE = 0.98
 AUX_DIFF_THRESHOLD = 1e-4
 AUX_REQUIRED_PASS_RATE = 0.995
 
-X_SHAPE = (1, int(os.environ.get("MHCS_GOLDEN_SIZE", "512")), HC_MULT, HIDDEN_SIZE)
+X_SHAPE = (int(os.environ.get("MHCS_GOLDEN_BATCH", "1")), int(os.environ.get("MHCS_GOLDEN_SIZE", "512")),
+           HC_MULT, HIDDEN_SIZE)
 
 
 def make_inputs():
@@ -131,11 +132,12 @@ def main():
           f"alpha={tuple(alpha.shape)}, bias={tuple(bias.shape)}")
 
     if args.dump_input:
-        bs = x.shape[0] * x.shape[1]
+        b_ = x.shape[0]
+        bs_ = x.shape[1]
         n, d = HC_MULT, HIDDEN_SIZE
-        x3 = x.reshape(bs, n, d)
+        x3 = x.reshape(b_ * bs_, n, d)
         with open(args.dump_input, "wb") as f:
-            f.write(struct.pack("<qqq", bs, n, d))
+            f.write(struct.pack("<qqqq", b_, bs_, n, d))  # 4-field header (b, bs, n, d)
             f.write(x3.view(torch.uint16).numpy().tobytes())
             f.write(phi.contiguous().numpy().tobytes())
             f.write(alpha.contiguous().numpy().tobytes())
@@ -173,6 +175,10 @@ def main():
                 hr_s = torch.from_numpy(
                     np.frombuffer(f.read(bs * n * n * 4), dtype=np.float32).copy()
                 ).reshape(bs, n, n)
+            # flatten golden outputs to match (b*bs) layout of the bin
+            h_in = h_in.reshape(bs, d)
+            h_post = h_post.reshape(bs, n)
+            h_res = h_res.reshape(bs, n, n)
             r = {"hIn": hin_s, "hPost": hp_s, "hRes": hr_s}
         else:
             r = torch.load(args.result, map_location="cpu")

@@ -34,7 +34,8 @@ Y_REQUIRED_PASS_RATE = 0.98
 AUX_DIFF_THRESHOLD = 1e-4
 AUX_REQUIRED_PASS_RATE = 0.995
 
-X_SHAPE = (1, int(os.environ.get("HC_PRE_SIZE", "512")), HC_MULT, HIDDEN_SIZE)  # 4D: batch=1, size=N, hc=4, d=4096
+X_SHAPE = (int(os.environ.get("HC_PRE_BATCH", "1")), int(os.environ.get("HC_PRE_SIZE", "512")),
+           HC_MULT, HIDDEN_SIZE)  # 4D: (b, bs, hc=4, d=4096); b*bs folds into operator bs dim
 
 
 def _make_hc_pre_inputs():
