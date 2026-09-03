@@ -186,6 +186,9 @@ source $LENVSH
 export ASCEND_CUSTOM_OPP_PATH=$LVENDOR
 PYBIND_SO=\$(ls $LREPO/vllm_ascend/vllm_ascend_C*.so | head -1)
 export HC_PRE_PYBIND_SO=\$PYBIND_SO
+# libvllm_ascend_kernels.so sits next to the pybind so; \$ORIGIN rpath is not
+# always honored by torch.ops.load_library (ctypes dlopen), so prepend explicitly.
+export LD_LIBRARY_PATH="\$(dirname "\$PYBIND_SO"):\${LD_LIBRARY_PATH:-}"
 export HC_PRE_SIZE=\$(( $B * $BS ))
 export HC_PRE_BATCH=$B
 export HC_PRE_COMPARE=1
@@ -209,6 +212,7 @@ export LD_LIBRARY_PATH=\$ASCEND_HOME_PATH/x86_64-linux/simulator/$SIM_SOC/lib:\$
 export ASCEND_CUSTOM_OPP_PATH=$LVENDOR
 PYBIND_SO=\$(ls $LREPO/vllm_ascend/vllm_ascend_C*.so | head -1)
 export HC_PRE_PYBIND_SO=\$PYBIND_SO
+export LD_LIBRARY_PATH="\$(dirname "\$PYBIND_SO"):\$LD_LIBRARY_PATH"
 export HC_PRE_SIZE=\$(( $B * $BS ))
 export HC_PRE_BATCH=$B
 export HC_PRE_COMPARE=1
@@ -241,6 +245,7 @@ which msprof >/dev/null 2>&1 || { echo "msprof not found"; exit 1; }
 export ASCEND_CUSTOM_OPP_PATH=$LVENDOR
 PYBIND_SO=\$(ls $LREPO/vllm_ascend/vllm_ascend_C*.so | head -1)
 export HC_PRE_PYBIND_SO=\$PYBIND_SO
+export LD_LIBRARY_PATH="\$(dirname "\$PYBIND_SO"):\${LD_LIBRARY_PATH:-}"
 export HC_PRE_SIZE=\$(( $B * $BS ))
 export HC_PRE_BATCH=$B
 export HC_PRE_COMPARE=0
