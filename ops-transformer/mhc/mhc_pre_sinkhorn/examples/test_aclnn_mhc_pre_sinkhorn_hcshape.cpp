@@ -5,9 +5,12 @@
  * dumps hin/hPost/hRes for comparison against hc_pre's y/post/comb_frag.
  *
  * Output bin layout: [code=0:int64][bs,n,d:int64x3][hin bf16][hPost fp32][hRes fp32 (n*n per row)]
+ *
+ * Device selection: env NPU_ID selects the card under test (default 0).
  */
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <vector>
 #include "acl/acl.h"
 #include "aclnn_mhc_pre_sinkhorn.h"
@@ -113,10 +116,18 @@ int main(int argc, char **argv)
            (long)mixHc, (long)numIters);
     fflush(stdout);
 
+    // Device selection: NPU_ID env var picks the card under test; unset/empty -> card 0.
+    const char *npuIdEnv = getenv("NPU_ID");
+    int32_t deviceId = (npuIdEnv != nullptr) ? static_cast<int32_t>(atoi(npuIdEnv)) : 0;
+    printf("[mhcs-ex] using NPU device %d\n", static_cast<int>(deviceId));
+    fflush(stdout);
+
     ret = static_cast<aclnnStatus>(aclInit(nullptr));
     CHECK_RET(ret == ACL_SUCCESS, "aclInit");
+    ret = static_cast<aclnnStatus>(aclrtSetDevice(deviceId));
+    CHECK_RET(ret == ACL_SUCCESS, "aclrtSetDevice");
     aclrtContext ctx; aclrtStream strm;
-    aclrtCreateContext(&ctx, 0);
+    aclrtCreateContext(&ctx, deviceId);
     aclrtCreateStream(&strm);
 
     void *xDev = nullptr, *phiDev = nullptr, *alphaDev = nullptr, *biasDev = nullptr;

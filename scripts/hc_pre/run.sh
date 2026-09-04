@@ -18,6 +18,7 @@
 #   HC_B / HC_BS        等效于位置参数 b / bs (默认 b=1, bs=2)
 #   HC_MODE             debug|release (默认 release, 可被 --debug/--release 覆盖)
 #   HC_SIM_TIMEOUT_MIN  仿真超时分钟数 (默认 30)
+#   NPU_ID              上板(board/perf)测试使用的 NPU 卡号 (默认 0; sim 为纯仿真, 固定 0)
 #   CONTAINER           强制指定容器名; 设 CONTAINER=none 强制本地执行;
 #                       未设置时自动探测 (docker 可用且默认容器在运行则用 docker, 否则本地)
 #
@@ -58,6 +59,7 @@ SIM_SOC=${HC_SIM_SOC:-Ascend910_9382}
 MODE=${HC_MODE:-release}
 B=${HC_B:-1}
 BS=${HC_BS:-2}
+NPU_ID=${NPU_ID:-0}
 OPNAME=hc_pre
 
 step() { echo -e "\n===== [hc_pre.run] $* ====="; }
@@ -175,7 +177,7 @@ EOS
 # 2. 上板精度
 # ---------------------------------------------------------------------------
 do_board() {
-  step "board accuracy test (b=$B, bs=$BS) [mode=$C]"
+  step "board accuracy test (b=$B, bs=$BS, npu=$NPU_ID) [mode=$C]"
   LWS=$([ "$C" = "none" ] && echo "$WS" || echo "$C_WS")
   LREPO=$LWS/vllm-ascend
   LENVSH=$LWS/scripts/container_env.sh
@@ -192,6 +194,7 @@ export LD_LIBRARY_PATH="\$(dirname "\$PYBIND_SO"):\${LD_LIBRARY_PATH:-}"
 export HC_PRE_SIZE=\$(( $B * $BS ))
 export HC_PRE_BATCH=$B
 export HC_PRE_COMPARE=1
+export NPU_ID=$NPU_ID
 python3 $LWS/scripts/hc_pre/hcpre_sim_app.py
 EOS
 }
@@ -216,6 +219,7 @@ export LD_LIBRARY_PATH="\$(dirname "\$PYBIND_SO"):\$LD_LIBRARY_PATH"
 export HC_PRE_SIZE=\$(( $B * $BS ))
 export HC_PRE_BATCH=$B
 export HC_PRE_COMPARE=1
+export NPU_ID=0
 rm -rf $LWS/sim_out; mkdir -p $LWS/sim_out
 msprof op simulator \\
   --application="python3 $LWS/scripts/hc_pre/hcpre_sim_app.py" \\
@@ -233,7 +237,7 @@ EOS
 # 4. 上板性能
 # ---------------------------------------------------------------------------
 do_perf() {
-  step "board performance (msprof, b=$B, bs=$BS) [mode=$C]"
+  step "board performance (msprof, b=$B, bs=$BS, npu=$NPU_ID) [mode=$C]"
   LWS=$([ "$C" = "none" ] && echo "$WS" || echo "$C_WS")
   LREPO=$LWS/vllm-ascend
   LENVSH=$LWS/scripts/container_env.sh
@@ -249,6 +253,7 @@ export LD_LIBRARY_PATH="\$(dirname "\$PYBIND_SO"):\${LD_LIBRARY_PATH:-}"
 export HC_PRE_SIZE=\$(( $B * $BS ))
 export HC_PRE_BATCH=$B
 export HC_PRE_COMPARE=0
+export NPU_ID=$NPU_ID
 rm -rf $LWS/perf_out; mkdir -p $LWS/perf_out
 msprof --application="python3 $LWS/scripts/hc_pre/hcpre_sim_app.py" \\
   --output=$LWS/perf_out \\

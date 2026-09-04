@@ -17,7 +17,8 @@
 # 环境变量:
 #   MHCS_B / MHCS_BS    等效位置参数 (默认 b=1, bs=2)
 #   MHCS_MODE           debug|release
-#   MHCS_SIM_TIMEOUT_MIN 仿真超时分钟 (默认 30)
+#   MHCS_SIM_TIMEOUT_MIN 仿真超时分钟数 (默认 30)
+#   NPU_ID              上板(board/perf)测试使用的 NPU 卡号 (默认 0; sim 为纯仿真, 固定 0)
 #   CONTAINER           强制指定容器名; 设 CONTAINER=none 强制本地; 未设置时自动探测
 #
 # 备注:
@@ -48,6 +49,7 @@ SIM_SOC=${MHCS_SIM_SOC:-Ascend910_9382}
 MODE=${MHCS_MODE:-release}
 B=${MHCS_B:-1}
 BS=${MHCS_BS:-2}
+NPU_ID=${NPU_ID:-0}
 
 step() { echo -e "\n===== [mhcs.run] $* ====="; }
 die()  { echo "ERROR: $*" >&2; exit 1; }
@@ -158,7 +160,7 @@ EOS
 # 2. board 精度
 # ---------------------------------------------------------------------------
 do_board() {
-  step "board accuracy (b=$B, bs=$BS, total_bs=$TOTAL_BS) [mode=$C]"
+  step "board accuracy (b=$B, bs=$BS, total_bs=$TOTAL_BS, npu=$NPU_ID) [mode=$C]"
   local LWS LREPO LENVSH LVENDOR LEXE
   LWS=$(lws); LREPO=$LWS/ops-transformer; LENVSH=$LWS/scripts/container_env.sh
   LVENDOR=$LWS/mhc_pre_install/vendors/custom_transformer
@@ -168,6 +170,7 @@ do_board() {
 set -e
 source $LENVSH
 export ASCEND_CUSTOM_OPP_PATH=$LVENDOR
+export NPU_ID=$NPU_ID
 $LEXE $LWS/mhcs_input_run.bin $LWS/mhcs_output_run.bin
 EOS
   xec <<EOS
@@ -192,6 +195,7 @@ do_sim() {
 set -e
 source $LENVSH
 export ASCEND_CUSTOM_OPP_PATH=$LVENDOR
+export NPU_ID=0
 export LD_LIBRARY_PATH=\$ASCEND_HOME_PATH/x86_64-linux/simulator/$SIM_SOC/lib:\$LD_LIBRARY_PATH
 rm -rf $LWS/sim_out_mhcs; mkdir -p $LWS/sim_out_mhcs
 msprof op simulator \\
@@ -216,7 +220,7 @@ EOS
 # 4. board 性能
 # ---------------------------------------------------------------------------
 do_perf() {
-  step "board performance (msprof, b=$B, bs=$BS) [mode=$C]"
+  step "board performance (msprof, b=$B, bs=$BS, npu=$NPU_ID) [mode=$C]"
   local LWS LREPO LENVSH LVENDOR LEXE
   LWS=$(lws); LREPO=$LWS/ops-transformer; LENVSH=$LWS/scripts/container_env.sh
   LVENDOR=$LWS/mhc_pre_install/vendors/custom_transformer
@@ -227,6 +231,7 @@ set -e
 source $LENVSH
 which msprof >/dev/null 2>&1 || { echo "msprof not found"; exit 1; }
 export ASCEND_CUSTOM_OPP_PATH=$LVENDOR
+export NPU_ID=$NPU_ID
 rm -rf $LWS/perf_out_mhcs; mkdir -p $LWS/perf_out_mhcs
 msprof --application="$LEXE $LWS/mhcs_input_run.bin $LWS/mhcs_output_run.bin" \\
   --output=$LWS/perf_out_mhcs 2>&1 | tail -3 || true

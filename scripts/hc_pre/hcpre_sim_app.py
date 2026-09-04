@@ -11,6 +11,7 @@ so the operator accepts it (same as tests/e2e/.../test_npu_hc_pre.py).
 Env:
   HC_PRE_PYBIND_SO   path to vllm_ascend_C.so (required)
   HC_PRE_COMPARE     "1" (default) to compare against CPU golden
+  NPU_ID             device index used for on-board runs (default 0)
 """
 
 import os
@@ -20,6 +21,9 @@ import torch_npu  # noqa: F401
 import torch.nn.functional as F
 
 torch_npu.npu.config.allow_internal_format = True
+
+NPU_ID = int((os.environ.get("NPU_ID") or "").strip() or 0)
+torch.npu.set_device(NPU_ID)
 
 HC_MULT = 4
 HIDDEN_SIZE = 4096
@@ -91,6 +95,7 @@ def _assert_close_with_pass_rate(actual, expected, *, name, diff_threshold, requ
 
 
 def main():
+    print(f"[sim-app] using NPU device {NPU_ID}")
     so_path = os.environ["HC_PRE_PYBIND_SO"]
     torch.ops.load_library(so_path)
 
