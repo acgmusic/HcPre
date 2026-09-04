@@ -26,6 +26,7 @@
 #   - 随机种子固定 1024; golden dump 的输入 bin 与上板/仿真共用
 #   - x shape = (b, bs, 4, 4096), 算子 api 校验要求 4D (A3 上 3D 被拒)
 #   - board/perf 需要真实 NPU; example 直接调 aclnnMhcPreSinkhorn (纯 C++ 无 torch 依赖)
+#   - board/sim/perf 运行前自动检测 example 二进制: 源码更新过则自动重编译 (免整包 build)
 # ============================================================================
 set -euo pipefail
 
@@ -79,6 +80,39 @@ set -e
 export TORCH_DEVICE_BACKEND_AUTOLOAD=0
 MHCS_GOLDEN_BATCH=$B MHCS_GOLDEN_SIZE=$BS python3 $LWS/scripts/mhc_pre_sinkhorn/run_golden.py \\
   --dump-input $LWS/mhcs_input_run.bin --save $LWS/golden_refs/mhcs_golden_b${B}_bs${BS}.pt 2>&1 | grep -E "golden.*(dumped|saved|outputs)"
+EOS
+}
+
+# ---------------------------------------------------------------------------
+# example 二进制守卫: 源码比二进制新 (或二进制缺失) 时仅重编译 example,
+# 避免为 example-only 改动 (如 perf 循环) 走整包 do_build
+# ---------------------------------------------------------------------------
+build_example() {
+  local LWS LREPO LENVSH LVENDOR LEXE
+  LWS=$(lws); LREPO=$LWS/ops-transformer; LENVSH=$LWS/scripts/container_env.sh
+  LVENDOR=$LWS/mhc_pre_install/vendors/custom_transformer
+  LEXE=$LREPO/build/test_aclnn_mhc_pre_sinkhorn_hcshape
+  xec <<EOS
+set -e
+[ -d $LVENDOR/op_api/lib ] || { echo "ERROR: vendor install missing at $LVENDOR (run 'bash run.sh build' first)"; exit 1; }
+source $LENVSH
+SRC=$LREPO/mhc/mhc_pre_sinkhorn/examples/test_aclnn_mhc_pre_sinkhorn_hcshape.cpp
+if [ ! -x "$LEXE" ] || [ "\$SRC" -nt "$LEXE" ]; then
+  echo "[mhcs.run] example binary missing/stale -> recompiling"
+  mkdir -p $LREPO/build
+  CUST_LIB="$LVENDOR/op_api/lib"
+  CUST_INC="$LVENDOR/op_api/include/aclnnop"
+  COMMON_INC="$LREPO/common/include/external"
+  g++ \$SRC \\
+    -I \$CUST_INC -I \$COMMON_INC -I \$ASCEND_HOME_PATH/include -I \$ASCEND_HOME_PATH/include/aclnn \\
+    -L \$CUST_LIB -L \$ASCEND_HOME_PATH/lib64 \\
+    -lopapi_math -lcust_opapi -lascendcl -lnnopbase -lc_sec \\
+    -o $LEXE \\
+    -Wl,-rpath=\$CUST_LIB
+  ls -la $LEXE
+else
+  echo "[mhcs.run] example binary up-to-date"
+fi
 EOS
 }
 
@@ -167,6 +201,7 @@ do_board() {
   LWS=$(lws); LREPO=$LWS/ops-transformer; LENVSH=$LWS/scripts/container_env.sh
   LVENDOR=$LWS/mhc_pre_install/vendors/custom_transformer
   LEXE=$LREPO/build/test_aclnn_mhc_pre_sinkhorn_hcshape
+  build_example
   gen_inputs
   xec <<EOS
 set -e
@@ -192,6 +227,7 @@ do_sim() {
   LWS=$(lws); LREPO=$LWS/ops-transformer; LENVSH=$LWS/scripts/container_env.sh
   LVENDOR=$LWS/mhc_pre_install/vendors/custom_transformer
   LEXE=$LREPO/build/test_aclnn_mhc_pre_sinkhorn_hcshape
+  build_example
   gen_inputs
   xec <<EOS
 set -e
@@ -227,6 +263,7 @@ do_perf() {
   LWS=$(lws); LREPO=$LWS/ops-transformer; LENVSH=$LWS/scripts/container_env.sh
   LVENDOR=$LWS/mhc_pre_install/vendors/custom_transformer
   LEXE=$LREPO/build/test_aclnn_mhc_pre_sinkhorn_hcshape
+  build_example
   gen_inputs
   xec <<EOS
 set -e
