@@ -19,6 +19,7 @@
 #   MHCS_MODE           debug|release
 #   MHCS_SIM_TIMEOUT_MIN 仿真超时分钟数 (默认 30)
 #   NPU_ID              上板(board/perf)测试使用的 NPU 卡号 (默认 0; sim 为纯仿真, 固定 0)
+#   MHCS_ITERS          perf 上板时算子 launch 次数 (默认 50, 输出 50 次采样统计)
 #   CONTAINER           强制指定容器名; 设 CONTAINER=none 强制本地; 未设置时自动探测
 #
 # 备注:
@@ -50,6 +51,7 @@ MODE=${MHCS_MODE:-release}
 B=${MHCS_B:-1}
 BS=${MHCS_BS:-2}
 NPU_ID=${NPU_ID:-0}
+ITERS=${MHCS_ITERS:-50}
 
 step() { echo -e "\n===== [mhcs.run] $* ====="; }
 die()  { echo "ERROR: $*" >&2; exit 1; }
@@ -220,7 +222,7 @@ EOS
 # 4. board 性能
 # ---------------------------------------------------------------------------
 do_perf() {
-  step "board performance (msprof, b=$B, bs=$BS, npu=$NPU_ID) [mode=$C]"
+  step "board performance (msprof, b=$B, bs=$BS, npu=$NPU_ID, iters=$ITERS) [mode=$C]"
   local LWS LREPO LENVSH LVENDOR LEXE
   LWS=$(lws); LREPO=$LWS/ops-transformer; LENVSH=$LWS/scripts/container_env.sh
   LVENDOR=$LWS/mhc_pre_install/vendors/custom_transformer
@@ -232,6 +234,7 @@ source $LENVSH
 which msprof >/dev/null 2>&1 || { echo "msprof not found"; exit 1; }
 export ASCEND_CUSTOM_OPP_PATH=$LVENDOR
 export NPU_ID=$NPU_ID
+export MHCS_ITERS=$ITERS
 rm -rf $LWS/perf_out_mhcs; mkdir -p $LWS/perf_out_mhcs
 msprof --application="$LEXE $LWS/mhcs_input_run.bin $LWS/mhcs_output_run.bin" \\
   --output=$LWS/perf_out_mhcs 2>&1 | tail -3 || true
@@ -240,17 +243,9 @@ echo "=== op_summary csv ==="
 find $LWS/perf_out_mhcs -name "op_summary_*.csv" -exec ls -la {} \; 2>/dev/null || echo "(none)"
 CSV=\$(find $LWS/perf_out_mhcs -name "op_summary_*.csv" | head -1)
 if [ -n "\$CSV" ]; then
-  echo
-  echo "=== Task Duration (us) ==="
-  python3 - "\$CSV" <<'PYEOF'
-import csv, sys
-with open(sys.argv[1]) as f:
-    rows = list(csv.DictReader(f))
-for r in rows:
-    name = r.get("Op Name") or r.get("Name") or "?"
-    dur = r.get("Task Duration(us)") or r.get("Task Duration") or "?"
-    print(f"  {name:<50} Task Duration = {dur} us")
-PYEOF
+  python3 $LWS/scripts/perf_stats.py "\$CSV" MhcPreSinkhorn || true
+else
+  echo "(no op_summary csv found)"
 fi
 EOS
 }

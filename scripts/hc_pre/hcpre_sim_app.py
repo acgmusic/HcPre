@@ -12,6 +12,7 @@ Env:
   HC_PRE_PYBIND_SO   path to vllm_ascend_C.so (required)
   HC_PRE_COMPARE     "1" (default) to compare against CPU golden
   NPU_ID             device index used for on-board runs (default 0)
+  HC_PRE_ITERS       number of op launches per run (default 1; perf uses 50)
 """
 
 import os
@@ -24,6 +25,8 @@ torch_npu.npu.config.allow_internal_format = True
 
 NPU_ID = int((os.environ.get("NPU_ID") or "").strip() or 0)
 torch.npu.set_device(NPU_ID)
+
+PERF_ITERS = max(1, int((os.environ.get("HC_PRE_ITERS") or "").strip() or 1))
 
 HC_MULT = 4
 HIDDEN_SIZE = 4096
@@ -103,19 +106,21 @@ def main():
     print(f"[sim-app] x={tuple(x.shape)} bf16, hc_fn={tuple(hc_fn.shape)} fp32, "
           f"hc_scale={tuple(hc_scale.shape)}, hc_base={tuple(hc_base.shape)}")
 
-    y, post, comb_frag = torch.ops._C_ascend.npu_hc_pre_v2(
-        x.npu(),
-        hc_fn.npu(),
-        hc_scale.npu(),
-        hc_base.npu(),
-        HC_MULT,
-        HC_SINKHORN_ITERS,
-        NORM_EPS,
-        HC_EPS,
-    )
+    y, post, comb_frag = None, None, None
+    for _ in range(PERF_ITERS):
+        y, post, comb_frag = torch.ops._C_ascend.npu_hc_pre_v2(
+            x.npu(),
+            hc_fn.npu(),
+            hc_scale.npu(),
+            hc_base.npu(),
+            HC_MULT,
+            HC_SINKHORN_ITERS,
+            NORM_EPS,
+            HC_EPS,
+        )
     torch.npu.synchronize()
-    print(f"[sim-app] outputs: y={tuple(y.shape)} {y.dtype}, post={tuple(post.shape)} {post.dtype}, "
-          f"comb_frag={tuple(comb_frag.shape)} {comb_frag.dtype}")
+    print(f"[sim-app] outputs (iters={PERF_ITERS}): y={tuple(y.shape)} {y.dtype}, "
+          f"post={tuple(post.shape)} {post.dtype}, comb_frag={tuple(comb_frag.shape)} {comb_frag.dtype}")
 
     dump_path = os.environ.get("HC_PRE_DUMP")
     if dump_path:

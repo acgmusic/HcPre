@@ -19,6 +19,7 @@
 #   HC_MODE             debug|release (默认 release, 可被 --debug/--release 覆盖)
 #   HC_SIM_TIMEOUT_MIN  仿真超时分钟数 (默认 30)
 #   NPU_ID              上板(board/perf)测试使用的 NPU 卡号 (默认 0; sim 为纯仿真, 固定 0)
+#   HC_PRE_ITERS        perf 上板时算子 launch 次数 (默认 50, 输出 50 次采样统计)
 #   CONTAINER           强制指定容器名; 设 CONTAINER=none 强制本地执行;
 #                       未设置时自动探测 (docker 可用且默认容器在运行则用 docker, 否则本地)
 #
@@ -60,6 +61,7 @@ MODE=${HC_MODE:-release}
 B=${HC_B:-1}
 BS=${HC_BS:-2}
 NPU_ID=${NPU_ID:-0}
+ITERS=${HC_PRE_ITERS:-50}
 OPNAME=hc_pre
 
 step() { echo -e "\n===== [hc_pre.run] $* ====="; }
@@ -237,7 +239,7 @@ EOS
 # 4. 上板性能
 # ---------------------------------------------------------------------------
 do_perf() {
-  step "board performance (msprof, b=$B, bs=$BS, npu=$NPU_ID) [mode=$C]"
+  step "board performance (msprof, b=$B, bs=$BS, npu=$NPU_ID, iters=$ITERS) [mode=$C]"
   LWS=$([ "$C" = "none" ] && echo "$WS" || echo "$C_WS")
   LREPO=$LWS/vllm-ascend
   LENVSH=$LWS/scripts/container_env.sh
@@ -254,6 +256,7 @@ export HC_PRE_SIZE=\$(( $B * $BS ))
 export HC_PRE_BATCH=$B
 export HC_PRE_COMPARE=0
 export NPU_ID=$NPU_ID
+export HC_PRE_ITERS=$ITERS
 rm -rf $LWS/perf_out; mkdir -p $LWS/perf_out
 msprof --application="python3 $LWS/scripts/hc_pre/hcpre_sim_app.py" \\
   --output=$LWS/perf_out \\
@@ -263,17 +266,9 @@ echo "=== op_summary csv ==="
 find $LWS/perf_out -name "op_summary_*.csv" -exec ls -la {} \; 2>/dev/null || echo "(none found)"
 CSV=\$(find $LWS/perf_out -name "op_summary_*.csv" | head -1)
 if [ -n "\$CSV" ]; then
-  echo
-  echo "=== Task Duration (us) ==="
-  python3 - "\$CSV" <<'PYEOF'
-import csv, sys
-with open(sys.argv[1]) as f:
-    rows = list(csv.DictReader(f))
-for r in rows:
-    name = r.get("Op Name") or r.get("Name") or "?"
-    dur = r.get("Task Duration(us)") or r.get("Task Duration") or "?"
-    print(f"  {name:<40} Task Duration = {dur} us")
-PYEOF
+  python3 $LWS/scripts/perf_stats.py "\$CSV" HcPre || true
+else
+  echo "(no op_summary csv found)"
 fi
 EOS
 }
