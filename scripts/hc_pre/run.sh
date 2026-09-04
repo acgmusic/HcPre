@@ -20,6 +20,7 @@
 #   HC_SIM_TIMEOUT_MIN  仿真超时分钟数 (默认 30)
 #   NPU_ID              上板(board/perf)测试使用的 NPU 卡号 (默认 0; sim 为纯仿真, 固定 0)
 #   HC_PRE_ITERS        perf 上板时算子 launch 次数 (默认 50, 输出 50 次采样统计)
+#   HC_PRE_DUMP         设置时 hc_pre board 额外把 NPU 输出 torch.save 到该路径 (对比脚本用)
 #   CONTAINER           强制指定容器名; 设 CONTAINER=none 强制本地执行;
 #                       未设置时自动探测 (docker 可用且默认容器在运行则用 docker, 否则本地)
 #
@@ -196,6 +197,7 @@ export LD_LIBRARY_PATH="\$(dirname "\$PYBIND_SO"):\${LD_LIBRARY_PATH:-}"
 export HC_PRE_SIZE=\$(( $B * $BS ))
 export HC_PRE_BATCH=$B
 export HC_PRE_COMPARE=1
+export HC_PRE_DUMP=${HC_PRE_DUMP:-}
 export NPU_ID=$NPU_ID
 python3 $LWS/scripts/hc_pre/hcpre_sim_app.py
 EOS
