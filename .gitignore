@@ -3,3 +3,6 @@
 sim_out/
 *.emmx
 *.eddx
+
+__pycache__/
+simopt_logs/
