@@ -140,14 +140,35 @@ public:
                     }
                     int64_t curUbLoops = (mVectorLength + tilingData->stage1MFactor - 1) / tilingData->stage1MFactor;
                     int64_t curUbMfactorTail = mVectorLength - ((curUbLoops - 1) * tilingData->stage1MFactor);
+                    // [simopt2] 仅在首个 cvLoop(尚无 AIC 读争用)做预取: MTE2 背靠背, cvLoop0 提前完成;
+                    // 后续 cvLoop 保持原节拍, 避免 CopyOut 突发加剧 MTE3 拥塞(变体B的回退根因)
+                    bool enablePrefetch = (cvLoopIdx_ == 0);
+                    if (enablePrefetch) {
+                        LocalTensor<T> xPrefetch = xQue.template AllocTensor<T>();
+                        int64_t pfOffset = mVectorOffset * tilingData->k + kGmBaseOffset;
+                        int64_t pfRows = (curUbLoops > 1) ? tilingData->stage1MFactor : curUbMfactorTail;
+                        CopyIn(xGm[pfOffset], xPrefetch, pfRows, realKGmSize, tilingData->k - realKGmSize);
+                        xQue.template EnQue(xPrefetch);
+                    }
                     for (int64_t i = 0; i < curUbLoops; ++i) {
                         int64_t curUbMFactor = (i != (curUbLoops - 1)) ? tilingData->stage1MFactor : curUbMfactorTail;
-                        xLocal = xQue.template AllocTensor<T>();
-                        int64_t curGlobalxOffset = (mVectorOffset + i * tilingData->stage1MFactor) *
-                        tilingData->k + kGmBaseOffset;
-                        CopyIn(xGm[curGlobalxOffset], xLocal, curUbMFactor, realKGmSize, tilingData->k - realKGmSize);
-                        xQue.template EnQue(xLocal);
+                        if (!enablePrefetch) {
+                            xLocal = xQue.template AllocTensor<T>();
+                            int64_t curGlobalxOffset = (mVectorOffset + i * tilingData->stage1MFactor) *
+                            tilingData->k + kGmBaseOffset;
+                            CopyIn(xGm[curGlobalxOffset], xLocal, curUbMFactor, realKGmSize, tilingData->k - realKGmSize);
+                            xQue.template EnQue(xLocal);
+                        }
                         xLocal = xQue.template DeQue<T>();
+                        // [simopt2] DeQue 后、Cast 发射前, 预取下一块进 MTE2 (仅 cvLoop0)
+                        if (enablePrefetch && i + 1 < curUbLoops) {
+                            LocalTensor<T> xPrefetch = xQue.template AllocTensor<T>();
+                            int64_t pfOffset = (mVectorOffset + (i + 1) * tilingData->stage1MFactor) *
+                                tilingData->k + kGmBaseOffset;
+                            int64_t pfRows = (i + 2 < curUbLoops) ? tilingData->stage1MFactor : curUbMfactorTail;
+                            CopyIn(xGm[pfOffset], xPrefetch, pfRows, realKGmSize, tilingData->k - realKGmSize);
+                            xQue.template EnQue(xPrefetch);
+                        }
                         xCastLocal = mmInQue.AllocTensor<float>();
                         CastTwoDim(xCastLocal, xLocal, curUbMFactor, realKGmSize);
                         xQue.template FreeTensor(xLocal);

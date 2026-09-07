@@ -487,25 +487,6 @@ __aicore__ inline void CastTwoDim(const LocalTensor<T0> &output, const LocalTens
 {
     uint32_t dim1AlignT0 = RoundUp<T0>(dim1);
     uint32_t dim1AlignT1 = RoundUp<T1>(dim1);
-    // [simopt2] 快路径: 行距(以 32B 块计)落在 repeat stride 上限时, 用单条多 repeat Cast
-    // 替代逐行循环, 将每块 ~5*dim0 条向量域指令压缩为 1 条 (Stage1 cast 场景:
-    // bf16 src 1024*2B/32=64, fp32 dst 1024*4B/32=128, dim0=15 均满足)。
-    // 数值与逐行路径完全一致: 相同 RoundMode、相同元素、相同行距。
-    uint32_t dstRepStride = dim1AlignT0 * sizeof(T0) / BLOCK_SIZE;
-    uint32_t srcRepStride = dim1AlignT1 * sizeof(T1) / BLOCK_SIZE;
-    if (dim0 > 1 && dim0 <= MAX_REPEAT_STRIDE && dim1 != 0 &&
-        dim1AlignT0 * sizeof(T0) % BLOCK_SIZE == 0 && dim1AlignT1 * sizeof(T1) % BLOCK_SIZE == 0 &&
-        dstRepStride <= MAX_REPEAT_STRIDE && srcRepStride <= MAX_REPEAT_STRIDE) {
-        if constexpr (IsSameType<T1, bfloat16_t>::value && IsSameType<T0, float>::value) {
-            Cast(output, input, AscendC::RoundMode::CAST_NONE, dim1, dim0,
-                 UnaryRepeatParams(1, 1, static_cast<uint8_t>(dstRepStride), static_cast<uint8_t>(srcRepStride)));
-        } else {
-            Cast(output, input, AscendC::RoundMode::CAST_RINT, dim1, dim0,
-                 UnaryRepeatParams(1, 1, static_cast<uint8_t>(dstRepStride), static_cast<uint8_t>(srcRepStride)));
-        }
-        PipeBarrier<PIPE_V>();
-        return;
-    }
     if constexpr (IsSameType<T1, bfloat16_t>::value && IsSameType<T0, float>::value) {
         for (uint32_t i = 0; i < dim0; i++) {
             Cast(output[i * dim1AlignT0], input[i * dim1AlignT1], AscendC::RoundMode::CAST_NONE, dim1);
