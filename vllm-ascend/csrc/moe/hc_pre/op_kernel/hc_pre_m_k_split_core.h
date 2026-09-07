@@ -140,7 +140,7 @@ public:
                     }
                     int64_t curUbLoops = (mVectorLength + tilingData->stage1MFactor - 1) / tilingData->stage1MFactor;
                     int64_t curUbMfactorTail = mVectorLength - ((curUbLoops - 1) * tilingData->stage1MFactor);
-                    // [simopt2] 预取: 先发射第 0 块搬入, MTE2 立即开工
+                    // [simopt2] 预取第 0 块, MTE2 立即开工
                     {
                         LocalTensor<T> xPrefetch = xQue.template AllocTensor<T>();
                         int64_t pfOffset = mVectorOffset * tilingData->k + kGmBaseOffset;
@@ -150,9 +150,10 @@ public:
                     }
                     for (int64_t i = 0; i < curUbLoops; ++i) {
                         int64_t curUbMFactor = (i != (curUbLoops - 1)) ? tilingData->stage1MFactor : curUbMfactorTail;
-                        // [simopt2] 先发射下一块 CopyIn(MTE2), 再发射本块 Cast(VEC):
-                        // V 队列被 WAIT_FLAG 卡住而 SCALAR 被背压时, MTE2 队列仍有存粮不空转。
-                        // xQue 深度 2: 预取 i+1 复用 i-1 轮释放的 slot, 时序上 Alloc 不会超深度
+                        xLocal = xQue.template DeQue<T>();
+                        // [simopt2] DeQue 之后、Cast 发射之前, 先把下一块的 CopyIn 发进 MTE2:
+                        // SCALAR 被 V 队列 WAIT_FLAG 背压时 MTE2 已有存粮, 搬运不空转。
+                        // 每 slot 的 Alloc->EnQue->DeQue->Free 调用周期与原实现一致(队列在飞块<=1)
                         if (i + 1 < curUbLoops) {
                             LocalTensor<T> xPrefetch = xQue.template AllocTensor<T>();
                             int64_t pfOffset = (mVectorOffset + (i + 1) * tilingData->stage1MFactor) *
@@ -161,7 +162,6 @@ public:
                             CopyIn(xGm[pfOffset], xPrefetch, pfRows, realKGmSize, tilingData->k - realKGmSize);
                             xQue.template EnQue(xPrefetch);
                         }
-                        xLocal = xQue.template DeQue<T>();
                         xCastLocal = mmInQue.AllocTensor<float>();
                         CastTwoDim(xCastLocal, xLocal, curUbMFactor, realKGmSize);
                         xQue.template FreeTensor(xLocal);
