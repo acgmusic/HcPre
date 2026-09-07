@@ -1,3 +1,5 @@
 .claude/
 .opencode/
 sim_out/
+*.emmx
+*.eddx
