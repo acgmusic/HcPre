@@ -52,6 +52,8 @@ constexpr int64_t ITER_TIMES_ATTR_IDX = 1;
 constexpr int64_t HC_EPS_ATTR_IDX = 2;
 constexpr int64_t NORM_EPS_ATTR_IDX = 3;
 constexpr int64_t DEFAULT_ITER_TIMES = 20;
+// [simopt5] Stage1 (Part1) 专用队列 buffer 数, 与 kernel 侧保持一致; Part2 仍用 DOUBLE_BUFFER
+constexpr int64_t STAGE1_QUE_BUF_NUM = 4;
 }
 
 ge::graphStatus HcPreTiling::GetPlatformInfo()
@@ -297,7 +299,11 @@ ge::graphStatus HcPreTiling::CalcOpTiling() {
     tilingData_.set_cubeCoreNum(static_cast<int64_t>(aicCoreNum_));
     // x type bfloat16, y type float32 and double
     // exit node 1 b16 input Queue and 1 b32 output Queue
-    int64_t lineByteSize = (sizeof(int16_t) + sizeof(int32_t)) * DOUBLE_BUFFER * tilingData_.get_cvLoopKSize();
+    // [simopt5] Stage1 队列 buffer 数 2 -> 4: 每行预算翻倍, stage1MFactor 减半(15 -> 7),
+    // 总 UB 占用不变(56KB + 112KB = 168KB), 队列深度换搬运块粒度。
+    // 注意: 不能改全局 DOUBLE_BUFFER(Part2 tiling 大量引用), 单独用 STAGE1_QUE_BUF_NUM
+    int64_t lineByteSize = (sizeof(int16_t) + sizeof(int32_t)) * STAGE1_QUE_BUF_NUM *
+    tilingData_.get_cvLoopKSize();
     int64_t stage1MFactorValue = ubSize_ / lineByteSize;
     tilingData_.set_stage1MFactor(stage1MFactorValue);
     return CalcMKSplitCoreMembasePart2Tiling();

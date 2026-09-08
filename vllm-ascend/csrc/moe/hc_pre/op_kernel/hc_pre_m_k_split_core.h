@@ -64,11 +64,14 @@ public:
             return;
         }
         // InQue
+        // [simopt5] Stage1 队列 buffer 数 2 -> 4 (tiling 侧 stage1MFactor 已相应减半,
+        // 总 UB 占用不变)。Part2 的队列仍为 NUM_TWO, 不受影响
+        constexpr int64_t stage1QueBufNum = 4;
         int64_t xQueNum = tilingData->stage1MFactor * RoundUp<T>(tilingData->cvLoopKSize);
-        pipe->InitBuffer(xQue, NUM_TWO, xQueNum * sizeof(T));
+        pipe->InitBuffer(xQue, stage1QueBufNum, xQueNum * sizeof(T));
 
         // OutQue
-        pipe->InitBuffer(mmInQue, NUM_TWO, xQueNum * sizeof(float));
+        pipe->InitBuffer(mmInQue, stage1QueBufNum, xQueNum * sizeof(float));
     }
 
     __aicore__ inline void Process()
