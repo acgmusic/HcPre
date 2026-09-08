@@ -1,0 +1,189 @@
+
+===== [hc_pre.run] msprof simulator (b=1, bs=512, soc=Ascend910_9382) [mode=cann_container] =====
+[env] ASCEND_HOME_PATH=/usr/local/Ascend/cann-9.1.0
+[WARN]  The option "--application" will be deprecated in future version. It is recommended to specify <app> [arguments] instead.
+=================================================================
+                   >>>>>   MindStudio   <<<<<
+    THE END-TO-END TOOLCHAIN TO UNLEASH HUAWEI ASCEND COMPUTE
+=================================================================
+
+[WARN]  Currently, the root permission is used, which is unrecommended. Please ensure the security of the execution environment and programs.
+[INFO]  Op profiling analysis start.
+[INFO]  Running simulation task: Binary Simulation Running, use simulator Ascend910 9382 by --soc-version
+[W908 00:08:23.109141577 FunctionLoader.cpp:48] Warning: LD_PRELOAD detected, FunctionLoader prefers RTLD_DEFAULT for symbol resolution. (function operator())
+[INFO] Config file [config_stars.json] from environment variable [CAMODEL_CONFIG_PATH]. Path: /root/HcPre/sim_out/OPPROF_20260908000822_EFDJAEWIDGQNKADM/device0/tmp_dump/config/config_stars.json
+[INFO] Config file is found, path is /root/HcPre/sim_out/OPPROF_20260908000822_EFDJAEWIDGQNKADM/device0/tmp_dump/config/config_stars.json.
+[FuncCache]: size:0x20000, line_size:128, way_num:16, line_num:1024, idx_num:64
+             idx_lsb:7, idx_mask:0x3f, tag_lsb:13, tag_mask:0xffffffffffffffff, ofst_mask:0x7f
+
+[TmSim]: Run in parallel worker mode, core num is: 24
+
+[INFO] Config file [config.json] from environment variable [CAMODEL_CONFIG_PATH]. Path: /root/HcPre/sim_out/OPPROF_20260908000822_EFDJAEWIDGQNKADM/device0/tmp_dump/config/config.json
+[W908 00:08:27.181058705 NPUCachingAllocator.cpp:202] Warning: The current CANN and HDK(driver) versions require processing for 32 padding size, with memory allocation. (function operator())
+[INFO] AicWrapper attach AIC 0, num_vec_core=2, num_subcore=3
+[INFO] AicWrapper attach AIC 1, num_vec_core=2, num_subcore=3
+[INFO] AicWrapper attach AIC 2, num_vec_core=2, num_subcore=3
+[INFO] AicWrapper attach AIC 3, num_vec_core=2, num_subcore=3
+[INFO] AicWrapper attach AIC 4, num_vec_core=2, num_subcore=3
+[INFO] AicWrapper attach AIC 5, num_vec_core=2, num_subcore=3
+[INFO] AicWrapper attach AIC 6, num_vec_core=2, num_subcore=3
+[INFO] AicWrapper attach AIC 7, num_vec_core=2, num_subcore=3
+[INFO] AicWrapper attach AIC 8, num_vec_core=2, num_subcore=3
+[INFO] AicWrapper attach AIC 9, num_vec_core=2, num_subcore=3
+[INFO] AicWrapper attach AIC 10, num_vec_core=2, num_subcore=3
+[INFO] AicWrapper attach AIC 11, num_vec_core=2, num_subcore=3
+[INFO] AicWrapper attach AIC 12, num_vec_core=2, num_subcore=3
+[INFO] AicWrapper attach AIC 13, num_vec_core=2, num_subcore=3
+[INFO] AicWrapper attach AIC 14, num_vec_core=2, num_subcore=3
+[INFO] AicWrapper attach AIC 15, num_vec_core=2, num_subcore=3
+[INFO] AicWrapper attach AIC 16, num_vec_core=2, num_subcore=3
+[INFO] AicWrapper attach AIC 17, num_vec_core=2, num_subcore=3
+[INFO] AicWrapper attach AIC 18, num_vec_core=2, num_subcore=3
+[INFO] AicWrapper attach AIC 19, num_vec_core=2, num_subcore=3
+[INFO] AicWrapper attach AIC 20, num_vec_core=2, num_subcore=3
+[INFO] AicWrapper attach AIC 21, num_vec_core=2, num_subcore=3
+[INFO] AicWrapper attach AIC 22, num_vec_core=2, num_subcore=3
+[INFO] AicWrapper attach AIC 23, num_vec_core=2, num_subcore=3
+[INFO] Chip 0 AIC / Scheduler / Soc periods: 200.0000 / 200.0000 / 105.0000
+[INFO] chip 0 die 0 device created
+>> Start ModelParsim with 20 threads for 25 thread units, mode is 0
+================================================================================
+>>>>                                                                        
+>>>>                             " PEM MODEL "                                
+>>>>             Total no. of 1 chip(s) Model Init Success!                
+>>>>                                                                        
+================================================================================
+[INFO] Model Start Time: 2026-09-08 00:08:27
+[DRVSTUB_LOG] driver_api.c:521 sendSwapBuf:swapbuf_base_addr:10000000
+[DRVSTUB_LOG] driver_api.c:522 sendSwapBuf:sq:0 swapbuf_addr:10000000
+[DRVSTUB_LOG] driver_api.c:521 sendSwapBuf:swapbuf_base_addr:10000000
+[DRVSTUB_LOG] driver_api.c:522 sendSwapBuf:sq:1 swapbuf_addr:10000040
+[DRVSTUB_LOG] driver_api.c:521 sendSwapBuf:swapbuf_base_addr:10000000
+[DRVSTUB_LOG] driver_api.c:522 sendSwapBuf:sq:2 swapbuf_addr:10000080
+[DRVSTUB_LOG] driver_api.c:521 sendSwapBuf:swapbuf_base_addr:10000000
+[DRVSTUB_LOG] driver_api.c:522 sendSwapBuf:sq:3 swapbuf_addr:100000c0
+[INFO] <ProfInit> Start profiling on kernel: HcPre_c12a9d608e5abdbd1728e849208025ff_0_mix_aic
+[INFO]  Extract 7916 relations from kernel
+[INFO]  Parse 48102 addr2line relations
+[sim-app] using NPU device 0
+[sim-app] x=(1, 512, 4, 4096) bf16, hc_fn=(24, 16384) fp32, hc_scale=(3,), hc_base=(24,)
+[sim-app] outputs (iters=1): y=(1, 512, 4096) torch.bfloat16, post=(1, 512, 4) torch.float32, comb_frag=(1, 512, 4, 4) torch.float32
+[compare] y: PASS pass_rate=99.31% (required 98.00%), max_abs_diff=3.125e-02
+[compare] post: PASS pass_rate=100.00% (required 99.50%), max_abs_diff=8.667e-05
+[compare] comb_frag: PASS pass_rate=100.00% (required 99.50%), max_abs_diff=6.258e-07
+[compare] overall: PASS
+DONE
+[INFO] Model Stop Time: 2026-09-08 00:16:19
+Model RUN TIME: 472972 ms
+[INFO] Total tick: 472519
+[INFO] Model stopped successfully.
+[INFO]  Profiling running finished. All task success.
+[INFO]  Core operator results run in simulator as follow:
+core_name           duration_time(us)   running_time(us)    
+core0.cubecore0     29.83               29.62               
+core0.veccore0      98.83               98.27               
+core0.veccore1      98.97               98.41               
+core1.cubecore0     29.84               29.62               
+core1.veccore0      98.97               98.41               
+core1.veccore1      99.1                98.55               
+core10.cubecore0    29.82               29.61               
+core10.veccore0     98.88               98.32               
+core10.veccore1     98.74               98.18               
+core11.cubecore0    29.82               29.6                
+core11.veccore0     98.99               98.43               
+core11.veccore1     99.13               98.57               
+core12.cubecore0    29.82               29.6                
+core12.veccore0     98.72               98.15               
+core12.veccore1     98.86               98.31               
+core13.cubecore0    29.82               29.61               
+core13.veccore0     98.98               98.41               
+core13.veccore1     98.83               98.27               
+core14.cubecore0    29.82               29.59               
+core14.veccore0     99.29               98.73               
+core14.veccore1     99.15               98.59               
+core15.cubecore0    29.82               29.6                
+core15.veccore0     98.95               98.39               
+core15.veccore1     98.82               98.25               
+core16.cubecore0    29.82               29.59               
+core16.veccore0     98.82               98.26               
+core16.veccore1     98.96               98.39               
+core17.cubecore0    29.82               29.59               
+core17.veccore0     99                  98.44               
+core17.veccore1     98.86               98.3                
+core18.cubecore0    29.81               29.6                
+core18.veccore0     98.91               98.35               
+core18.veccore1     98.77               98.22               
+core19.cubecore0    29.82               29.6                
+core19.veccore0     98.72               98.16               
+core19.veccore1     98.87               98.31               
+core2.cubecore0     29.83               29.62               
+core2.veccore0      99.09               98.53               
+core2.veccore1      98.95               98.39               
+core20.cubecore0    29.81               29.6                
+core20.veccore0     98.85               98.29               
+core20.veccore1     98.99               98.43               
+core21.cubecore0    29.81               29.59               
+core21.veccore0     98.84               98.28               
+core21.veccore1     98.98               98.42               
+core22.cubecore0    29.81               29.61               
+core22.veccore0     98.58               98.06               
+core22.veccore1     98.72               98.19               
+core23.cubecore0    29.81               29.6                
+core23.veccore0     69.84               69.81               
+core23.veccore1     30.21               29.55               
+core3.cubecore0     29.83               29.61               
+core3.veccore0      99                  98.44               
+core3.veccore1      98.86               98.3                
+core4.cubecore0     29.83               29.61               
+core4.veccore0      98.95               98.39               
+core4.veccore1      98.81               98.25               
+core5.cubecore0     29.83               29.61               
+core5.veccore0      98.88               98.33               
+core5.veccore1      99.02               98.46               
+core6.cubecore0     29.83               29.61               
+core6.veccore0      99.11               98.56               
+core6.veccore1      98.97               98.41               
+core7.cubecore0     29.83               29.6                
+core7.veccore0      98.9                98.34               
+core7.veccore1      99.03               98.47               
+core8.cubecore0     29.83               29.61               
+core8.veccore0      98.77               98.21               
+core8.veccore1      98.91               98.35               
+core9.cubecore0     29.82               29.6                
+core9.veccore0      99.02               98.45               
+core9.veccore1      99.16               98.59               
+[INFO]  Start parse dump file
+[INFO]  Profiling results saved in /root/HcPre/sim_out/OPPROF_20260908000822_EFDJAEWIDGQNKADM
+[INFO]  Profiling data parse finished.
+[INFO]  Op profiling finish. Welcome to next use.
+--- sim csv summary ---
+found 72 cores with instr_exe.csv; showing top 8 by total cycles
+
+=== core19.veccore0  total=3056877 cycles ===
+    VECTOR           81.6%
+    MTE3              7.9%
+    SCALAR            6.7%
+    MTE2              3.3%
+    FLOWCTRL          0.5%
+    ALL               0.0%
+    top: BAR pipe=VECTOR calls=627 cycles=379656
+    top: BAR pipe=VECTOR calls=9 cycles=216133
+    top: BAR pipe=VECTOR calls=209 cycles=130242
+
+=== core12.veccore0  total=3055850 cycles ===
+    VECTOR           81.6%
+    MTE3              7.9%
+    SCALAR            6.7%
+    MTE2              3.3%
+    FLOWCTRL          0.5%
+    ALL               0.0%
+    top: BAR pipe=VECTOR calls=627 cycles=379656
+    top: BAR pipe=VECTOR calls=9 cycles=216112
+    top: BAR pipe=VECTOR calls=209 cycles=130242
+
+=== core8.veccore0  total=3055353 cycles ===
+    VECTOR           81.6%
+    MTE3              7.8%
+    SCALAR            6.7%
+    MTE2              3.3%
+    FLOWCTRL          0.5%
