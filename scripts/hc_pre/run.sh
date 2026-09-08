@@ -161,8 +161,6 @@ PYBIN=\$(which python3)
 TNPU_LOC=\$(python3 -m pip show torch-npu | awk '/^Location:/ {print \$2}')
 cmake -S $LREPO -B $LREPO/build-pybind \\
   -DCMAKE_BUILD_TYPE=Release \\
-  -DCMAKE_C_COMPILER_LAUNCHER=ccache \\
-  -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \\
   -DASCEND_HOME_PATH=\$ASCEND_HOME_PATH \\
   -DPYTHON_EXECUTABLE=\$PYBIN \\
   -DPYTHON_INCLUDE_PATH=\$(python3 -c "from sysconfig import get_paths; print(get_paths()['include'])") \\

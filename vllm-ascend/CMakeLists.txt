@@ -79,6 +79,18 @@ else()
     )
 endif()
 
+# ccache for host (g++) translation units only. Deliberately placed AFTER
+# ascendc_library(): CANN's legacy_modules/function.cmake forwards
+# CMAKE_*_COMPILER_LAUNCHER into the inner ExternalProject builds, and
+# ccache in front of ccec produces invalid aicore objects
+# (ld.lld: "unknown file type"). Do NOT pass -DCMAKE_CXX_COMPILER_LAUNCHER
+# on the command line for this project.
+find_program(VLLM_ASCEND_CCACHE ccache)
+if(VLLM_ASCEND_CCACHE)
+    set(CMAKE_C_COMPILER_LAUNCHER ${VLLM_ASCEND_CCACHE})
+    set(CMAKE_CXX_COMPILER_LAUNCHER ${VLLM_ASCEND_CCACHE})
+endif()
+
 message("TORCH_NPU_PATH is ${TORCH_NPU_PATH}")
 
 if(SOC_VERSION MATCHES "ascend310p.*")
