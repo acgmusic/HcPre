@@ -143,14 +143,29 @@ public:
                     }
                     int64_t curUbLoops = (mVectorLength + tilingData->stage1MFactor - 1) / tilingData->stage1MFactor;
                     int64_t curUbMfactorTail = mVectorLength - ((curUbLoops - 1) * tilingData->stage1MFactor);
+                    // [simopt6] 预取第 0 块, MTE2 立即开工 (变体B模式: 与 4-buffer 叠加)
+                    {
+                        LocalTensor<T> xPrefetch = xQue.template AllocTensor<T>();
+                        int64_t pfOffset = mVectorOffset * tilingData->k + kGmBaseOffset;
+                        int64_t pfRows = (curUbLoops > 1) ? tilingData->stage1MFactor : curUbMfactorTail;
+                        CopyIn(xGm[pfOffset], xPrefetch, pfRows, realKGmSize, tilingData->k - realKGmSize);
+                        xQue.template EnQue(xPrefetch);
+                    }
                     for (int64_t i = 0; i < curUbLoops; ++i) {
                         int64_t curUbMFactor = (i != (curUbLoops - 1)) ? tilingData->stage1MFactor : curUbMfactorTail;
-                        xLocal = xQue.template AllocTensor<T>();
-                        int64_t curGlobalxOffset = (mVectorOffset + i * tilingData->stage1MFactor) *
-                        tilingData->k + kGmBaseOffset;
-                        CopyIn(xGm[curGlobalxOffset], xLocal, curUbMFactor, realKGmSize, tilingData->k - realKGmSize);
-                        xQue.template EnQue(xLocal);
                         xLocal = xQue.template DeQue<T>();
+                        // [simopt6] DeQue 之后、Cast 发射之前, 先把下一块的 CopyIn 发进 MTE2:
+                        // SCALAR 被 V 队列 WAIT_FLAG 背压时 MTE2 已有存粮, 搬运不空转。
+                        // 4-buffer 下 Alloc(i+1) 时最多 1 块在飞(xLocal), 池中恒有空闲 slot,
+                        // 且每 slot 的 Alloc->EnQue->DeQue->Free 调用周期保持严格串行
+                        if (i + 1 < curUbLoops) {
+                            LocalTensor<T> xPrefetch = xQue.template AllocTensor<T>();
+                            int64_t pfOffset = (mVectorOffset + (i + 1) * tilingData->stage1MFactor) *
+                                tilingData->k + kGmBaseOffset;
+                            int64_t pfRows = (i + 2 < curUbLoops) ? tilingData->stage1MFactor : curUbMfactorTail;
+                            CopyIn(xGm[pfOffset], xPrefetch, pfRows, realKGmSize, tilingData->k - realKGmSize);
+                            xQue.template EnQue(xPrefetch);
+                        }
                         xCastLocal = mmInQue.AllocTensor<float>();
                         CastTwoDim(xCastLocal, xLocal, curUbMFactor, realKGmSize);
                         xQue.template FreeTensor(xLocal);
