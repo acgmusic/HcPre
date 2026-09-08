@@ -459,11 +459,13 @@ int64_t curBsIdxForAll = (stage2BlockIdx * tilingData->rowLoopOfFormerBlock +
                     tilingData->hcMult * NUM_TWO;
                 for (int64_t i = 0; i < stage1UsedCoreNum; ++i) {
                     mixes2Local = mixesQue2.AllocTensor<float>();
+                    // [simopt8] 与基线相同的子块突发形态 (nBurst x copyLen=hcMult, stride=0):
+                    // 16B 突发各占一个 32B 槽位, token r 的 hc 行 j 落在 r*32 + j*8 ——
+                    // 即下游 softmax/Sinkhorn 期望的 (C, hcMult, hcMultAlign) 布局;
+                    // 一次调用装下整个 K 分片的 C 个 token (GM 侧 16 值/token 连续)
                     CopyIn(workspaceGm[combSrcBase + i * tilingData->bs * mmLastAxisSize +
                            cBase * mmLastAxisSize],
-                           mixes2Local, C, tilingData->hcMult * tilingData->hcMult,
-                           mmLastAxisSize - tilingData->hcMult * tilingData->hcMult,
-                           combCols - tilingData->hcMult * tilingData->hcMult);
+                           mixes2Local, C * tilingData->hcMult, tilingData->hcMult);
                     mixesQue2.EnQue(mixes2Local);
                     mixes2Local = mixesQue2.DeQue<float>();
                     if (i == 0) {
