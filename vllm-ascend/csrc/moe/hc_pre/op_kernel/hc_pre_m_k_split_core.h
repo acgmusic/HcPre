@@ -79,20 +79,6 @@ public:
             CrossCoreSetFlag<SYNC_MODE2, PIPE_FIX>(SYNC_AIC_TO_AIV_FLAG);
         }
 
-        if ASCEND_IS_AIV {
-            // [simopt4] 错峰: 按 blockIdx 拉开各 AIV 的喂数节奏(每档 1 行小搬运 ~0.2us)。
-            // 48 个 AIV 从同一时刻起步、以相同节拍跑 cvLoop, 在 cvLoop 边界形成 44 路同步
-            // MTE3 写 herd + 22 路 AIC GM 读 herd, 读优先级把 MTE3 单条挤到 5us(实测)。
-            // 起步错峰 %8 档(~1.4us 展开)打散同步边界。dummy 仅读 xGm 一行, 对结果无影响。
-            for (int64_t w = 0; w < static_cast<int64_t>(GetBlockIdx() % 2); ++w) {
-                LocalTensor<T> xDummy = xQue.template AllocTensor<T>();
-                CopyIn(xGm[w * tilingData->k], xDummy, 1, 32, tilingData->k - 32);
-                xQue.template EnQue(xDummy);
-                xDummy = xQue.template DeQue<T>();
-                xQue.template FreeTensor(xDummy);
-            }
-        }
-
         uint64_t curBlockIdx = GetBlockIdx();
         uint64_t curVectorBlockIdx = curBlockIdx;
         if ASCEND_IS_AIV {
