@@ -92,6 +92,30 @@ xQue/mmInQue 从 2×15 行改为 4×7 行（总 UB 168KB<180KB 不变；独立�
 - 容器 `/root` 是 Ubuntu WSL `/root` 的 bind mount（Docker Desktop 路径翻译）：容器与 WSL 共享同一 `/root/HcPre` 工作副本（tar 同步自 D:）；msprof 产物落在此处（root:750 权限，WSL 侧 wang 用户 du/ls 会静默失败并产生误导性小数值——用 docker cp/docker exec 读取）。
 - 上午 master 合入的编译提速三件套（ccache 作用域、merge_obj_text 幂等、eol=lf）已验证：连续两次无变更构建成功且无 "unknown file type"（d3d10dad 修复生效），构建 ~2 分钟；已合入 simopt1/2/4 分支（simopt5/6 从 master 直接分出，天然包含）。
 
+## 第三轮实验（2026-09-08 傍晚）：opt7 Stage2 初始化前移 ✅ 单点最优
+
+### 问题定位（基线 trace 实测）
+
+SyncAll 释放（29.56µs，由最慢 AIC FIXP 决定）到首个 FIXP 依赖操作（squareSum CopyIn @31.14µs）之间有 **1.57µs AIV 串行初始化**：op2.Init 的 TPipe 表写入（0.07µs）+ hcBase 三分片 CopyIn 发射与搬运（0.86µs）+ SetGatherMaskPattern（1.1µs，与搬运重叠）——全部只依赖 kernel 输入，而 AIV 自 21.4µs 起空等尾部 flag（~8µs 空闲窗口）。
+
+### 实现（`simopt7-stage2-early-init`，`408d69d0`）
+
+拆分 Part1 尾部：`FinishCore()`（本核异步收尾：AIC=End，AIV=MTE3_S 排空，置于 `pipe.Destroy()` 前）+ `WaitPeer()`（跨核等待+SyncAll）。hc_pre.cpp 顺序改为 `Process → FinishCore → pipe.Destroy → op2.Init → op2.Prefetch（hcBase 搬入）→ WaitPeer → op2.Process`。
+
+### 首版回退教训（`37f88fc9`，WALL 99.33 = +0.7µs）
+
+`op2.Init` 无条件跑在两种核上——AIC 的 ~1.25µs TPipe 表操作被串行插入"FIXP 完成→SyncAll"关键路径，把屏障从 29.9 推迟到 31.2（全体 AIV 出现新的 1.27µs 等待）。基线中 AIC 的这段在 SyncAll 之后执行、与 AIV Part2 并行，本不占关键路径；前移时必须让 **AIC 跳过 op2.Init/Prefetch**（Part2 为纯 AIV 阶段）。
+
+### 结果（3 次运行，全 PASS，逐位一致）
+
+| 指标 | 基线 | opt7 |
+|---|---|---|
+| WALL | 98.57 / 98.70 | **97.476 / 97.424 / 97.607**（均值 97.5，**−1.1µs / −1.1%**） |
+| hcBase 搬运时刻 | 30.86µs（SyncAll 后） | **23.5µs**（空闲窗口内） |
+| SyncAll 后到 squareSum | ~1.57µs | ~0（直接进工作搬运） |
+
+**当前单点排名**：opt7 97.5 < opt5（4-buffer）97.78 < opt6 98.36 < 基线 98.6x。opt7 与 opt5 改动相互独立（Part2 尾部 vs Part1 队列形态），可叠加（预估 ~96.9，未验证）。产物：`sim_out/opt7_stage2_early_init/`（仅 visualize_data.bin + README）。
+
 ## 附：真正值得投入的下一个方向
 
 本次 4 个优化点全部针对 Part1 喂数流水（仅占 wall ~30%），而实测瓶颈图景是：
