@@ -1,0 +1,75 @@
+
+===== [hc_pre.run] build hc_pre (release, soc=ascend910_93) [mode=cann_container] =====
+[env] ASCEND_HOME_PATH=/usr/local/Ascend/cann-9.1.0
+[monitor] started pgid=251: bash build.sh --pkg --ops=hc_pre --soc=ascend910_93 -j20
+[monitor] log: /root/HcPre/logs/hc_op_build.log
+[monitor] command finished, rc=0
+[build] kernel .o: HcPre_c12a9d608e5abdbd1728e849208025ff.o size=1124768 (release)
+[env] ASCEND_HOME_PATH=/usr/local/Ascend/cann-9.1.0
+grep: warning: stray \ before -
+Verifying archive integrity...     0%    46%    92%  100%   SHA256 checksums are OK. All good.
+Uncompressing version:1.0     0%    46%    92%  100%  
+[ops_custom] [2026-09-08 01:41:19] [INFO] validate shared libraries before installation
+[ops_custom] [2026-09-08 01:41:20] [INFO] upgrade framework
+[ops_custom] [2026-09-08 01:41:20] [INFO] no need to upgrade ops framework files
+[ops_custom] [2026-09-08 01:41:20] [INFO] upgrade op proto
+inc lib 
+[ops_custom] [2026-09-08 01:41:20] [INFO] replace or merge old ops op_proto files ......
+[ops_custom] [2026-09-08 01:41:20] [INFO] copy new ops op_proto files ......
+[ops_custom] [2026-09-08 01:41:20] [INFO] upgrade op impl
+ai_core 
+[ops_custom] [2026-09-08 01:41:20] [INFO] replace or merge old ops op_impl files ......
+[ops_custom] [2026-09-08 01:41:20] [INFO] copy new ops op_impl files ......
+[ops_custom] [2026-09-08 01:41:20] [INFO] upgrade op api
+include lib 
+[ops_custom] [2026-09-08 01:41:20] [INFO] replace or merge old ops op_api files ......
+[ops_custom] [2026-09-08 01:41:20] [INFO] copy new ops op_api files ......
+[ops_custom] [2026-09-08 01:41:20] [INFO] upgrade uninstall
+[ops_custom] [2026-09-08 01:41:20] [INFO] copy new uninstall.sh files ......
+[ops_custom] [2026-09-08 01:41:20] [INFO] upgrade version.info
+[ops_custom] [2026-09-08 01:41:20] [INFO] copy new version.info files ......
+[ops_custom] [2026-09-08 01:41:20] [INFO] no need to upgrade custom.proto files
+[ops_custom] [2026-09-08 01:41:20] [INFO] using requirements: when custom module install finished or before you run the custom module, execute the command [ source /root/HcPre/vllm-ascend/vllm_ascend/_cann_ops_custom/vendors/custom_transformer/bin/set_env.bash ] to set the environment path
+SUCCESS
+installed to /root/HcPre/vllm-ascend/vllm_ascend/_cann_ops_custom/vendors/custom_transformer
+[env] ASCEND_HOME_PATH=/usr/local/Ascend/cann-9.1.0
+CMake Warning (author) at /usr/local/python3.11.15/lib/python3.11/site-packages/pybind11/share/cmake/pybind11/FindPythonLibsNew.cmake:101 (message):
+  Policy CMP0148 is not set: The FindPythonInterp and FindPythonLibs modules
+  are removed.  Run "cmake --help-policy CMP0148" for policy details.  Use
+  the cmake_policy command to set the policy and suppress this warning, or
+  preferably upgrade to using FindPython, either by calling it explicitly
+  before pybind11, or by setting PYBIND11_FINDPYTHON ON before pybind11.
+Call Stack (most recent call first):
+  /usr/local/python3.11.15/lib/python3.11/site-packages/pybind11/share/cmake/pybind11/pybind11Tools.cmake:44 (find_package)
+  /usr/local/python3.11.15/lib/python3.11/site-packages/pybind11/share/cmake/pybind11/pybind11Common.cmake:243 (include)
+  /usr/local/python3.11.15/lib/python3.11/site-packages/pybind11/share/cmake/pybind11/pybind11Config.cmake:257 (include)
+  CMakeLists.txt:15 (find_package)
+This warning is for project developers.  Use -Wno-author to suppress it.
+
+CMake Warning (deprecated) at /usr/local/python3.11.15/lib/python3.11/site-packages/pybind11/share/cmake/pybind11/FindPythonLibsNew.cmake:110 (cmake_policy):
+  The OLD behavior for policy CMP0148 will be removed from a future version
+  of CMake.
+
+  The cmake-policies(7) manual explains that the OLD behaviors of all
+  policies are deprecated and that a policy should be set to OLD only under
+  specific short-term circumstances.  Projects should be ported to the NEW
+  behavior and not rely on setting a policy to OLD.
+Call Stack (most recent call first):
+  /usr/local/python3.11.15/lib/python3.11/site-packages/pybind11/share/cmake/pybind11/pybind11Tools.cmake:44 (find_package)
+  /usr/local/python3.11.15/lib/python3.11/site-packages/pybind11/share/cmake/pybind11/pybind11Common.cmake:243 (include)
+  /usr/local/python3.11.15/lib/python3.11/site-packages/pybind11/share/cmake/pybind11/pybind11Config.cmake:257 (include)
+  CMakeLists.txt:15 (find_package)
+This warning is for project developers.  Use -Wno-author or -Wno-deprecated
+to suppress it.
+
+CMake Warning at /usr/local/python3.11.15/lib/python3.11/site-packages/torch/share/cmake/Torch/TorchConfig.cmake:22 (message):
+  static library kineto_LIBRARY-NOTFOUND not found.
+Call Stack (most recent call first):
+  /usr/local/python3.11.15/lib/python3.11/site-packages/torch/share/cmake/Torch/TorchConfig.cmake:125 (append_torchlib_if_found)
+  CMakeLists.txt:20 (find_package)
+
+
+TORCH_NPU_PATH is /usr/local/python3.11.15/lib/python3.11/site-packages/torch_npu
+-rwxr-xr-x 1 root root 1009144 Sep  8 01:42 /root/HcPre/vllm-ascend/vllm_ascend/vllm_ascend_C.cpython-311-x86_64-linux-gnu.so
+
+===== [hc_pre.run] build done (release) =====
