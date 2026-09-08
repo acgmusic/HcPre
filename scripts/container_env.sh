@@ -65,15 +65,24 @@ fi
 
 echo "[env] ASCEND_HOME_PATH=${ASCEND_HOME_PATH}"
 
-# --- 4. merge_obj_text.sh idempotency guard (self-healing) ---
+# --- 4. merge_obj_text.sh idempotency guard (self-healing, any arch) ---
 # The in-place ld.lld text merge in CANN's legacy_modules is not idempotent and
 # breaks no-change incremental pybind rebuilds ("unknown file type"). The
-# patched copy lives in the workspace (cann-9.1.0/.../merge_obj_text.sh, marked
-# HC_MERGE_GUARD); apply it to the active CANN install when missing.
-_merge_dst="${ASCEND_HOME_PATH}/x86_64-linux/tikcpp/ascendc_kernel_cmake/legacy_modules/util/merge_obj_text.sh"
+# patched copy lives in the workspace (cann-9.1.0/x86_64-linux/.../merge_obj_text.sh,
+# marked HC_MERGE_GUARD; the script itself is arch-independent); apply it to the
+# active CANN install (x86_64-linux docker or aarch64-linux real machine) when missing.
 _merge_src="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/cann-9.1.0/x86_64-linux/tikcpp/ascendc_kernel_cmake/legacy_modules/util/merge_obj_text.sh"
-if [ -f "${_merge_dst}" ] && [ -f "${_merge_src}" ] && ! grep -q "HC_MERGE_GUARD" "${_merge_dst}" 2>/dev/null; then
-    if cp "${_merge_src}" "${_merge_dst}" 2>/dev/null; then
-        echo "[env] applied HC_MERGE_GUARD patch to ${_merge_dst}"
-    fi
+if [ -f "${_merge_src}" ]; then
+    for _arch in x86_64-linux aarch64-linux; do
+        _merge_dst="${ASCEND_HOME_PATH}/${_arch}/tikcpp/ascendc_kernel_cmake/legacy_modules/util/merge_obj_text.sh"
+        if [ -f "${_merge_dst}" ] && ! grep -q "HC_MERGE_GUARD" "${_merge_dst}" 2>/dev/null; then
+            if cp "${_merge_src}" "${_merge_dst}" 2>/dev/null; then
+                echo "[env] applied HC_MERGE_GUARD patch to ${_merge_dst}"
+            else
+                echo "[env] WARN: ${_merge_dst} lacks the HC_MERGE_GUARD patch and is not writable" >&2
+                echo "[env] WARN: incremental pybind rebuild will fail until you run:" >&2
+                echo "[env] WARN:   sudo cp ${_merge_src} ${_merge_dst}" >&2
+            fi
+        fi
+    done
 fi
