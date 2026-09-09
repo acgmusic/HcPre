@@ -459,13 +459,21 @@ int64_t curBsIdxForAll = (stage2BlockIdx * tilingData->rowLoopOfFormerBlock +
                     tilingData->hcMult * NUM_TWO;
                 for (int64_t i = 0; i < stage1UsedCoreNum; ++i) {
                     mixes2Local = mixesQue2.AllocTensor<float>();
-                    // [simopt8] 与基线相同的子块突发形态 (nBurst x copyLen=hcMult, stride=0):
-                    // 16B 突发各占一个 32B 槽位, token r 的 hc 行 j 落在 r*32 + j*8 ——
-                    // 即下游 softmax/Sinkhorn 期望的 (C, hcMult, hcMultAlign) 布局;
-                    // 一次调用装下整个 K 分片的 C 个 token (GM 侧 16 值/token 连续)
-                    CopyIn(workspaceGm[combSrcBase + i * tilingData->bs * mmLastAxisSize +
-                           cBase * mmLastAxisSize],
-                           mixes2Local, C * tilingData->hcMult, tilingData->hcMult);
+                    // [simopt8] 按 hc 行分 4 次子块突发装载(与基线相同的 copyLen=hcMult 形态):
+                    // 源侧 token 间 128-float 行距(srcStride=124 gap); 目的侧每个 16B 突发占一个
+                    // 32B 槽位, 槽距 4(dstStride=24) -> token r 的 hc 行 j 落在 r*32+j*8,
+                    // 即下游 softmax/Sinkhorn 期望的 (C, hcMult, hcMultAlign) 布局
+                    for (int64_t j = 0; j < tilingData->hcMult; ++j) {
+                        // 源侧: 每 burst 4 float, 间隔 124 float -> token 间距 mmLastAxisSize;
+                        // 目的侧: 16B burst 占 1 个 32B 槽, dstStride 参数按元素计、
+                        // helper 内部 /8 转 32B 块 -> 需额外 3 槽间隙 = 24 元素,
+                        // 使 burst r 落在槽 j+4r, 即 (C, hcMult, hcMultAlign) 布局
+                        CopyIn(workspaceGm[combSrcBase + i * tilingData->bs * mmLastAxisSize +
+                               cBase * mmLastAxisSize + j * tilingData->hcMult],
+                               mixes2Local[j * tilingData->hcMultAlign], C, tilingData->hcMult,
+                               mmLastAxisSize - tilingData->hcMult,
+                               (tilingData->hcMult - 1) * (BLOCK_SIZE / sizeof(float)));
+                    }
                     mixesQue2.EnQue(mixes2Local);
                     mixes2Local = mixesQue2.DeQue<float>();
                     if (i == 0) {
