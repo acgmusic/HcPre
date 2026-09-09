@@ -278,8 +278,13 @@ public:
             RoundUp<T>(tilingData->dFactor) * sizeof(float));
         pipe->InitBuffer(rsqrtBuf,
             RoundUp<float>(tilingData->stage2RowFactor) * sizeof(float));
+        // [simopt8] 逐行 rsqrt 暂存: 每个行组一个 32B 对齐槽(步长 RoundUp(rowFactor)),
+        // VEC/Brcb 指令要求操作数基址 32B 对齐 —— 按 4B 粒度紧排会上板触发
+        // "UB address accessed by the VEC instruction is not aligned"(AIVector 异常),
+        // 仿真器不检查基址对齐所以 sim 不报错
         pipe->InitBuffer(rsqrtAllBuf,
-            RoundUp<float>(tilingData->rowOfFormerBlock) * sizeof(float));
+            tilingData->rowOfFormerBlock * RoundUp<float>(tilingData->stage2RowFactor) *
+            sizeof(float));
         pipe->InitBuffer(maskPatternBuf,
             RoundUp<uint32_t>(MASK_PATTERN_BASE_SIZE * MASK_PATTERN_REPEAT_SIZE) *
             sizeof(uint32_t));
@@ -354,6 +359,9 @@ public:
 
             // ===== loop 1: 每行 squareSum/pre/y/post (与原实现逐行等价,
             // 仅 rsqrt 结果额外写入 rsqrtAllLocal 供 comb 批处理使用) =====
+            // [simopt8] rsqrtAllLocal 槽步长: RoundUp(rowFactor) 个 float, 保证每行组
+            // 切片基址 32B 对齐(VEC/Brcb 基址对齐要求, 见 InitTBufBuffers 注释)
+            int64_t rsqrtSlotStride = RoundUp<float>(tilingData->stage2RowFactor);
             for (int64_t rowOuterIdx = 0; rowOuterIdx < rowOuterLoop; rowOuterIdx++) {
                 int64_t xGmBsBaseOffsetPart2 = rowOuterIdx * tilingData->stage2RowFactor *
                 tilingData->hcMult * tilingData->d;
@@ -372,7 +380,7 @@ public:
                 curRowFactor * SQUARE_SUM_SIZE);
 int64_t curBsIdxForAll = (stage2BlockIdx * tilingData->rowLoopOfFormerBlock +
                 rowOuterIdx) * tilingData->stage2RowFactor;
-                LocalTensor<float> rsqrtSlice = rsqrtAllLocal[rowOuterIdx * tilingData->stage2RowFactor];
+                LocalTensor<float> rsqrtSlice = rsqrtAllLocal[rowOuterIdx * rsqrtSlotStride];
                 GatherMaskByDiagonal(rsqrtSlice, squareReduceLocal,
                 maskPatternLocal[(curBsIdxForAll % SQUARE_SUM_SIZE) * 8], curRowFactor);
                 float coeff = 1.0f / static_cast<float>(tilingData->k);
@@ -492,7 +500,11 @@ int64_t curBsIdxForAll = (stage2BlockIdx * tilingData->rowLoopOfFormerBlock +
                 }
 
                 for (int64_t r = 0; r < C; ++r) {
-                    float rsVal = rsqrtAllLocal.GetValue(cBase + r);
+                    // [simopt8] 按 32B 对齐槽读取对应行的 rsqrt 值(与 loop1 写入槽位一致)
+                    int64_t gIdx = cBase + r;
+                    float rsVal = rsqrtAllLocal.GetValue(
+                        gIdx / tilingData->stage2RowFactor * rsqrtSlotStride +
+                        gIdx % tilingData->stage2RowFactor);
                     Muls(mixes02ReduceLocal[r * combCols], mixes02ReduceLocal[r * combCols], rsVal, combCols);
                 }
                 PipeBarrier<PIPE_V>();
