@@ -57,6 +57,12 @@ public:
     __aicore__ inline void Init(const GlobalTensor<float>& xGm, const GlobalTensor<float>& fnGm, TPipe *tpipe);
     __aicore__ inline void ComputeDecode(const AscendC::GlobalTensor<float> &xGm, const AscendC::GlobalTensor<float> &workspaceGlobalA2,
         const AscendC::GlobalTensor<float> &workspaceGlobalAB, const MmParams &mmParams);
+    // [simopt10 B] y = Σ_h diag(pre_h) @ x_h 的 cube 计算:
+    // A1 = A-stage 对角块 (16m × 16k), B1 = xT[h] 的 (n=dTile, k=16t) nz 分形,
+    // 按 h 顺序累加 L0C 后 Fixpipe nz2nd 写 yFp32Ws (t, d) fp32
+    __aicore__ inline void ComputeY(const AscendC::GlobalTensor<float> &aStageGm,
+        const AscendC::GlobalTensor<float> &xTGm, const AscendC::GlobalTensor<float> &yFp32Gm,
+        uint64_t groupNum, uint64_t dSize, uint64_t tPitch, uint64_t coreNum);
     __aicore__ inline void CopyInB1(
     uint64_t mGmOffset, uint64_t kGmOffset, uint64_t kL1Size, const MmParams &mmParams);
     __aicore__ inline void SetBL1Mte1ToMte2Flag();
@@ -189,6 +195,76 @@ __aicore__ inline void HC_PRE_CUBE_COMPUTE_TEMPLATE_CLASS::CopyInA1(
     nd2nzParams.dstNzNStride = 1;
     nd2nzParams.dstNzMatrixStride = 1;
     DataCopy(al1Local, aGlobal, nd2nzParams);
+}
+
+HC_PRE_CUBE_COMPUTE_TEMPLATE_PARAM
+__aicore__ inline void HC_PRE_CUBE_COMPUTE_TEMPLATE_CLASS::ComputeY(
+    const AscendC::GlobalTensor<float> &aStageGm, const AscendC::GlobalTensor<float> &xTGm,
+    const AscendC::GlobalTensor<float> &yFp32Gm, uint64_t groupNum, uint64_t dSize, uint64_t tPitch,
+    uint64_t coreNum)
+{
+    // 粒度: 单条 Mmad (m=16 t, n=Y_N_TILE d, k=16 t'), L0C (16, Y_N_TILE) fp32;
+    // 每 (g, dTile) 按 h=0..3 顺序累加(与 AIV 逐行 ReduceSumARAPerf 的 h 序一致),
+    // 然后 Fixpipe nz2nd 一次写出。Y_N_TILE 为粒度棘轮常量(256 → 64 → 16 逐级回退)
+    constexpr uint64_t Y_N_TILE = 256;
+    constexpr uint64_t Y_EVT = 7;          // ComputeY 专用事件 id; 注意避开 M_MTE1 的
+                                           // L0B 槽位 id 5/6(Init 武装), 各 HardEvent
+                                           // 类型独立编号, 7 在 MTE1_M/MTE2_MTE1/M_MTE1 均空闲
+    uint64_t blkIdx = static_cast<uint64_t>(GetBlockIdx());
+    for (uint64_t g = blkIdx; g < groupNum; g += coreNum) {
+        for (uint64_t dTile = 0; dTile < dSize; dTile += Y_N_TILE) {
+            for (uint64_t h = 0; h < 4; ++h) {
+                // A1: A-stage 对角块 (16m × 16k) Nd2Nz → L1A[0] → L0A[0]
+                Nd2NzParams aParams;
+                aParams.ndNum = 1;
+                aParams.nValue = 16;
+                aParams.dValue = 16;
+                aParams.srcNdMatrixStride = 1;
+                aParams.srcDValue = 16;
+                aParams.dstNzC0Stride = 16;
+                aParams.dstNzNStride = 1;
+                aParams.dstNzMatrixStride = 1;
+                DataCopy(l1a_[0], aStageGm[(g * 4 + h) * 16 * 16], aParams);
+                SetFlag<HardEvent::MTE2_MTE1>(Y_EVT);
+                WaitFlag<HardEvent::MTE2_MTE1>(Y_EVT);
+                MmParams yParams;
+                yParams.curML1 = 16;
+                yParams.curNL1 = Y_N_TILE;
+                LoadAToL0A(0, 16, 0, yParams);
+                SetFlag<HardEvent::MTE1_M>(Y_EVT);
+                WaitFlag<HardEvent::MTE1_M>(Y_EVT);
+                // B1: xT[h] 的 (n=Y_N_TILE d, k=16 t) nz → L1B[0] → L0B[0]
+                Nd2NzParams bParams;
+                bParams.ndNum = 1;
+                bParams.nValue = Y_N_TILE;
+                bParams.dValue = 16;
+                bParams.srcNdMatrixStride = 1;
+                bParams.srcDValue = tPitch;
+                bParams.dstNzC0Stride = Y_N_TILE;
+                bParams.dstNzNStride = 1;
+                bParams.dstNzMatrixStride = 1;
+                DataCopy(l1b_[0], xTGm[h * dSize * tPitch + dTile * tPitch + g * 16], bParams);
+                SetFlag<HardEvent::MTE2_MTE1>(Y_EVT);
+                WaitFlag<HardEvent::MTE2_MTE1>(Y_EVT);
+                LoadBToL0B(0, 16, 0, yParams);
+                SetFlag<HardEvent::MTE1_M>(Y_EVT);
+                WaitFlag<HardEvent::MTE1_M>(Y_EVT);
+                MmadParams mmadParams;
+                mmadParams.m = 16;
+                mmadParams.n = Y_N_TILE;
+                mmadParams.k = 16;
+                mmadParams.cmatrixInitVal = (h == 0);
+                mmadParams.cmatrixSource = false;
+                mmadParams.unitFlag = (h == 3) ? UNIT_FLAG_ENABLE_AUTO_CLOSE : UNIT_FLAG_ENABLE;
+                Mmad(l0c_[0], l0a_[0], l0b_[0], mmadParams);
+                // Mmad 完成前禁止覆写 l0a_[0]/l0b_[0]/l0c_[0]
+                SetFlag<HardEvent::M_MTE1>(Y_EVT);
+                WaitFlag<HardEvent::M_MTE1>(Y_EVT);
+            }
+            // Fixpipe: L0C (16, Y_N_TILE) nz2nd → yFp32Ws 行距 dSize
+            CopyOut(yFp32Gm[g * 16 * dSize + dTile], l0c_[0], 16, Y_N_TILE, true, dSize);
+        }
+    }
 }
 
 HC_PRE_CUBE_COMPUTE_TEMPLATE_PARAM

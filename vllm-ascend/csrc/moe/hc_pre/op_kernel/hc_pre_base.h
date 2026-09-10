@@ -69,6 +69,16 @@ __aicore__ inline void SetGatherMaskPattern(const LocalTensor<uint32_t>& maskPat
     PipeBarrier<PIPE_V>();
 }
 
+// [simopt10 B] 标量写 UB 后的可见性屏障(向量指令读取前调用)。
+// 模式来自 CANN arithprogression/dav_l300 实现: SetFlag/WaitFlag<S_V> 使
+// SCALAR 侧写入对后续 VECTOR 指令可见
+__aicore__ inline void ScalarToVectorSync()
+{
+    event_t eventIdSToV = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::S_V));
+    SetFlag<HardEvent::S_V>(eventIdSToV);
+    WaitFlag<HardEvent::S_V>(eventIdSToV);
+}
+
 __aicore__ inline void GatherMaskByDiagonal(const LocalTensor<float>& output, const LocalTensor<float>& input,
                                             const LocalTensor<uint32_t> maskPattern, uint16_t dim0)
 {

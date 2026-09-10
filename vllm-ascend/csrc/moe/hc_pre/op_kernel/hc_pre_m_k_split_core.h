@@ -58,6 +58,13 @@ public:
             static_cast<uint64_t>(WORKSPACE_ALIGN_SIZE)) / sizeof(float);
         squareSumFp32WsGm.SetGlobalBuffer((__gm__ float *)workspace + wsOffset);
         squareSumFp32BufSize_ = CeilAlign(tilingData->bs, BLOCK_CUBE) * BLOCK_CUBE;
+        wsOffset += CeilAlign(tilingData->cubeBlockDimK * squareSumFp32BufSize_ * sizeof(float),
+            static_cast<uint64_t>(WORKSPACE_ALIGN_SIZE)) / sizeof(float);
+        // [simopt10 B] xT 区: (h, d, t) 主序 fp32 转置副本(行距 bs), AIC y-mm 的 B1 源
+        xTWsGm.SetGlobalBuffer((__gm__ float *)workspace + wsOffset);
+        xTFp32BufSize_ = tilingData->hcMult * tilingData->d * tilingData->bs;
+        wsOffset += CeilAlign(xTFp32BufSize_ * sizeof(float),
+            static_cast<uint64_t>(WORKSPACE_ALIGN_SIZE)) / sizeof(float);
 
         if ASCEND_IS_AIC {
             cubeCompute_.Init(xCastFp32WsGm, hcFnGm, pipePtr);
@@ -69,6 +76,15 @@ public:
 
         // OutQue
         pipe->InitBuffer(mmInQue, NUM_TWO, xQueNum * sizeof(float));
+
+        // [simopt10 B] 转置中转队列: (realK, 16) fp32 双缓冲(V→MTE3 由队列同步)
+        pipe->InitBuffer(transQue, NUM_TWO, TRANSPOSE_SUB_W * 16 * sizeof(float));
+        // [simopt10 B] Gather 转置的 offsets 表(按字节, 对所有子块相同):
+        // offsets[i] = ((i%16)*realK + i/16) * sizeof(float), i ∈ [0, 16*realK)
+        // 构造: iota16 倍增链 → ×(realK*4) → 4 个 k 切片 → 63 个 r 切片(+16r 字节)
+        pipe->InitBuffer(gatherOffsetsBuf, TRANSPOSE_SUB_W * 16 * sizeof(uint32_t));
+        gatherOffsetsLocal = gatherOffsetsBuf.Get<uint32_t>();
+        BuildGatherOffsets();
     }
 
     __aicore__ inline void Process()
@@ -140,8 +156,17 @@ public:
                     }
                     int64_t curUbLoops = (mVectorLength + tilingData->stage1MFactor - 1) / tilingData->stage1MFactor;
                     int64_t curUbMfactorTail = mVectorLength - ((curUbLoops - 1) * tilingData->stage1MFactor);
+                    // [simopt10 B] 延迟转置: tile i 的 xT 产线滞后 2 槽执行, 不阻塞 flag-8
+                    LocalTensor<float> xCastTiles[NUM_TWO];
                     for (int64_t i = 0; i < curUbLoops; ++i) {
                         int64_t curUbMFactor = (i != (curUbLoops - 1)) ? tilingData->stage1MFactor : curUbMfactorTail;
+                        if (i >= NUM_TWO) {
+                            // 被转置的 tile i-2 恒为非尾部 tile (行数 = stage1MFactor)
+                            TransposeXtAndStore(xCastTiles[i % NUM_TWO], realKGmSize, kGmBaseOffset,
+                                mVectorOffset + (i - NUM_TWO) * tilingData->stage1MFactor,
+                                tilingData->stage1MFactor);
+                            mmInQue.FreeTensor(xCastTiles[i % NUM_TWO]);
+                        }
                         xLocal = xQue.template AllocTensor<T>();
                         int64_t curGlobalxOffset = (mVectorOffset + i * tilingData->stage1MFactor) *
                         tilingData->k + kGmBaseOffset;
@@ -158,9 +183,16 @@ public:
                         tilingData->cvLoopKSize;
                         CopyOut(xCastLocal, xCastFp32WsGm[cutMmInOffset], curUbMFactor, realKGmSize,
                         tilingData->cvLoopKSize - realKGmSize);
-                        mmInQue.FreeTensor(xCastLocal);
+                        xCastTiles[i % NUM_TWO] = xCastLocal;
                     }
+                    // xCast 乒乓区全部就绪即放行 AIC (flag-8 排在尾随转置之前)
                     CrossCoreSetFlag<SYNC_MODE2, PIPE_MTE3>(SYNC_AIV_TO_AIC_FLAG);
+                    for (int64_t t = curUbLoops < NUM_TWO ? 0 : curUbLoops - NUM_TWO; t < curUbLoops; ++t) {
+                        int64_t curUbMFactor = (t != (curUbLoops - 1)) ? tilingData->stage1MFactor : curUbMfactorTail;
+                        TransposeXtAndStore(xCastTiles[t % NUM_TWO], realKGmSize, kGmBaseOffset,
+                            mVectorOffset + t * tilingData->stage1MFactor, curUbMFactor);
+                        mmInQue.FreeTensor(xCastTiles[t % NUM_TWO]);
+                    }
                 }
                 cvLoopIdx_++;
             }
@@ -175,18 +207,92 @@ public:
     }
 
 private:
+    // [simopt10 B] 构造 Gather 转置的 offsets(字节单位, 对所有子块相同)。
+    // 目标: dst[i] = src[off[i]/4], i = 64r + 16q + t (r=repeat, q∈[0,4), t∈[0,16)),
+    // off[i] = t*realK*4 + (4r+q)*4 = P[16q+t] + 16r, 其中 P[16q+t] = t*realK*4 + q*4。
+    // 实现: 标量 SetValue 建 64 元模式 P(小表一次性, 模式同 CANN arithprogression),
+    // S_V 同步后用对齐 Adds 复制 63 个 repeat 块 —— 全程无 4B 粒度未对齐的 VEC 基址
+    __aicore__ inline void BuildGatherOffsets()
+    {
+        uint32_t rowBytes = TRANSPOSE_SUB_W * sizeof(float);
+        for (uint32_t q = 0; q < 4; ++q) {
+            for (uint32_t t = 0; t < 16; ++t) {
+                gatherOffsetsLocal.SetValue(16 * q + t, t * rowBytes + q * sizeof(float));
+            }
+        }
+        ScalarToVectorSync();
+        for (uint32_t r = 1; r < 64; ++r) {
+            Adds(gatherOffsetsLocal[64 * r], gatherOffsetsLocal, 16 * r, 64);
+            PipeBarrier<PIPE_V>();
+        }
+    }
+
+    // [simopt10 B] cast tile (rows × realK, 行距 realK) 按 16 行子块转置为 (realK, 16),
+    // 写入 xT[(h*d + d0)*bs + tokenBase] 行距 bs。
+    // 约束: d % cvLoopKSize == 0 (子块 k 范围不跨 h), rows 为 16 的倍数
+    __aicore__ inline void TransposeXtAndStore(const LocalTensor<float> &tile, uint64_t realK,
+                                               uint64_t kGmBaseOffset, uint64_t tokenBase, uint64_t rows)
+    {
+        if (!ENABLE_XT_TRANSPOSE) {
+            return;  // [DEBUG bisect] 二分开关: 定位挂死/崩溃来源
+        }
+        if ((tilingData->d % tilingData->cvLoopKSize) != 0 || (rows % 16) != 0) {
+            return; // 非适配 shape 不产 xT (本优化面向 d 为 cvLoopKSize 倍数的 shape)
+        }
+        uint64_t h = kGmBaseOffset / tilingData->d;
+        uint64_t d0 = kGmBaseOffset % tilingData->d;
+        for (uint64_t r = 0; r < rows; r += 16) {
+            LocalTensor<float> transLocal = transQue.template AllocTensor<float>();
+            if (ENABLE_V4DTRANS) {
+                // 路线 1: Transpose 增强接口(dav_c220 软件流水) —— msprof 仿真挂死,
+                // 留开关供上板对比; 需 (cSize+2)*h0*w0*sizeof 的临时 Buffer
+                TransposeParamsExt tp;
+                tp.nSize = 1;
+                tp.cSize = TRANSPOSE_CSIZE;
+                tp.hSize = 1;
+                tp.wSize = realK;
+                tp.transposeType = TransposeType::TRANSPOSE_NCHW2NHWC;
+                Transpose<float>(transLocal, tile[r * realK],
+                    transTmpLocal.ReinterpretCast<uint8_t>(), tp);
+            } else {
+                // 路线 2(默认): Gather(offsets) 元素转置 —— 纯 vector 指令, offsets 表
+                // 全局相同(字节单位, Init 时构造), 一次调用转置整个 (16, realK) 子块
+                Gather(transLocal, tile[r * realK], gatherOffsetsLocal, 0,
+                       16 * realK);
+            }
+            transQue.template EnQue(transLocal);
+            transLocal = transQue.template DeQue<float>();
+            CopyOut(transLocal, xTWsGm[(h * tilingData->d + d0) * tilingData->bs + tokenBase + r],
+                realK, 16, tilingData->bs - 16);
+            transQue.template FreeTensor(transLocal);
+        }
+    }
+
     TPipe *pipe;
     const HcPreTilingData *tilingData;
     GlobalTensor<float> workspaceGm;
     GlobalTensor<float> xCastFp32WsGm;
     GlobalTensor<float> mmOutFp32WsGm;
     GlobalTensor<float> squareSumFp32WsGm;
+    GlobalTensor<float> xTWsGm;   // [simopt10 B] (h, d, t) 主序 fp32 x 转置副本
     GlobalTensor<float> hcFnGm;
     GlobalTensor<T> xGm;
 
     TQue<QuePosition::VECIN, 1> xQue;
 
     TQue<QuePosition::VECOUT, 1> mmInQue;
+
+    // [simopt10 B] xT 转置中转队列(V→MTE3 同步由队列负责), 槽 = (realK, 16) fp32
+    TQue<QuePosition::VECOUT, 1> transQue;
+    TBuf<QuePosition::VECCALC> gatherOffsetsBuf;  // Gather 转置的 offsets 表(字节)
+    LocalTensor<uint32_t> gatherOffsetsLocal;
+    TBuf<QuePosition::VECCALC> transTmpBuf;   // Transpose 增强接口的临时 Buffer(仅 v4d 路线)
+    LocalTensor<float> transTmpLocal;
+    static constexpr uint64_t TRANSPOSE_SUB_W = 256;  // 与 cvLoopKSize 对应的子块宽
+    static constexpr uint64_t TRANSPOSE_CSIZE = 16;   // 转置 C 维 (= 转置的 token 行数)
+    // [DEBUG bisect] 转置路线开关: true=Transpose 增强接口(板), false=Gather offsets(sim/板)
+    static constexpr bool ENABLE_XT_TRANSPOSE = true;
+    static constexpr bool ENABLE_V4DTRANS = false;
 
     LocalTensor<T> xLocal;
     LocalTensor<float> xCastLocal;
@@ -200,6 +306,7 @@ private:
 
     uint64_t cvLoopIdx_ = 0;
     uint64_t xCastFp32BufSize_;
+    uint64_t xTFp32BufSize_;   // [simopt10 B]
     uint64_t mmOuterInnerSize_;
     uint64_t mmOutFp32BufSize_;
     uint64_t squareSumFp32BufSize_;
@@ -316,12 +423,30 @@ public:
         pipe = pipePtr;
         tilingData = tilingDataPtr;
         InitGlobalBuffers(x, hcScale, hcBase, y, post, combFrag, workspace);
+        if ASCEND_IS_AIC {
+            // [simopt10 B] AIC 在 Part2 承担 y-mm: 重建 L1/L0 缓冲(Part1 的 pipe 已 Destroy)
+            cubeCompute2_.Init(workspaceGm, workspaceGm, pipePtr);
+            return;
+        }
         int64_t stage1UsedCoreNum = tilingData->cubeBlockDimK;
         int64_t xQueNum2 = tilingData->stage2RowFactor * tilingData->hcMult *
         RoundUp<T>(tilingData->dFactor);
         InitQueBuffers(stage1UsedCoreNum, xQueNum2);
         InitTBufBuffers(xQueNum2);
+        // [simopt10 B] A-stage 对角行暂存 (hcMult × 16 float, V→MTE3 由队列同步)
+        pipe->InitBuffer(aStageQue, NUM_TWO, tilingData->hcMult * 16 * sizeof(float));
+        // [simopt10 B] 16×16 单位阵(行主序, 供 A-stage 对角行 Mul)+ 16 元广播暂存
+        pipe->InitBuffer(identityBuf, 16 * 16 * sizeof(float));
+        pipe->InitBuffer(aStageBcastBuf, 16 * sizeof(float));
         GetLocalTensors();
+        identityLocal = identityBuf.Get<float>();
+        aStageBcastLocal = aStageBcastBuf.Get<float>();
+        for (int64_t tl = 0; tl < 16; ++tl) {
+            for (int64_t j = 0; j < 16; ++j) {
+                identityLocal.SetValue(tl * 16 + j, tl == j ? 1.0f : 0.0f);
+            }
+        }
+        ScalarToVectorSync();
     }
     __aicore__ inline void Process()
     {
@@ -330,6 +455,9 @@ public:
             int64_t stage2BlockIdx = GetBlockIdx();
             int64_t stage2UsedCoreNum = tilingData->secondUsedCoreNum;
             if (stage2BlockIdx >= stage2UsedCoreNum) {
+                // [simopt10 B] 空闲 AIV 必须参与 #2/#3 两个 barrier 配对, 否则永不释放
+                SyncAll<false>();
+                SyncAll<false>();
                 return;
             }
             int64_t mmLastAxisSize = CeilAlign(tilingData->hcMix, MM_CACHE_LINE_BYTES / sizeof(float));
@@ -338,6 +466,17 @@ public:
             int64_t workspaceSize1 = tilingData->cubeCoreNum * DOUBLE_BUFFER * xCastFp32BufSize;
             int64_t workspaceSize2 = CeilAlign(stage1UsedCoreNum * tilingData->bs *
             mmLastAxisSize * sizeof(float), WORKSPACE_ALIGN_SIZE) / sizeof(float);
+            // [simopt10 B] 后续区域: squareSum | xT | A-stage | yFp32 (与 Part1/AIC 分支公式一致)
+            int64_t wsSquareSum = CeilAlign(stage1UsedCoreNum * SQUARE_SUM_SIZE *
+            CeilAlign(tilingData->bs, SQUARE_SUM_SIZE) * sizeof(float), WORKSPACE_ALIGN_SIZE) /
+            sizeof(float);
+            int64_t wsXT = CeilAlign(tilingData->hcMult * tilingData->d * tilingData->bs *
+            sizeof(float), WORKSPACE_ALIGN_SIZE) / sizeof(float);
+            int64_t aStageSize = CeilDiv(tilingData->bs, 16) * tilingData->hcMult * 16 * 16;
+            int64_t aStageWsOffset = CeilAlign(aStageSize * sizeof(float),
+            WORKSPACE_ALIGN_SIZE) / sizeof(float);
+            int64_t aStageWsBase = workspaceSize1 + workspaceSize2 + wsSquareSum + wsXT;
+            int64_t yFp32WsBase = aStageWsBase + aStageWsOffset;
             CopyIn(hcBaseGm, hcBase0Local, 1, tilingData->hcMult);
             CopyIn(hcBaseGm[tilingData->hcMult], hcBase1Local, 1, tilingData->hcMult);
             CopyIn(hcBaseGm[tilingData->hcMult * NUM_TWO], hcBase2Local, tilingData->hcMult, tilingData->hcMult);
@@ -352,19 +491,17 @@ public:
                                                                         tilingData->tailRowFactorOfFormerBlock;
             int64_t xGmBlockBaseOffsetPart2 = stage2BlockIdx *
             tilingData->rowOfFormerBlock * tilingData->hcMult * tilingData->d;
+            (void)xGmBlockBaseOffsetPart2;  // [simopt10 B] y 卸载后不再读 x
             // [simopt8] comb 批处理: 本核总行数与单批行数
             int64_t rowTotal = rowOuterLoop * tilingData->stage2RowFactor;
             int64_t combBatchRows = rowTotal < COMB_BATCH_MAX_ROWS ? rowTotal : COMB_BATCH_MAX_ROWS;
             int64_t combCols = tilingData->hcMult * tilingData->hcMultAlign;
 
-            // ===== loop 1: 每行 squareSum/pre/y/post (与原实现逐行等价,
-            // 仅 rsqrt 结果额外写入 rsqrtAllLocal 供 comb 批处理使用) =====
+            // ===== [simopt10 B] phase 0: 逐行 squareSum 归约 + rsqrt 暂存 (comb 前置依赖) =====
             // [simopt8] rsqrtAllLocal 槽步长: RoundUp(rowFactor) 个 float, 保证每行组
             // 切片基址 32B 对齐(VEC/Brcb 基址对齐要求, 见 InitTBufBuffers 注释)
             int64_t rsqrtSlotStride = RoundUp<float>(tilingData->stage2RowFactor);
             for (int64_t rowOuterIdx = 0; rowOuterIdx < rowOuterLoop; rowOuterIdx++) {
-                int64_t xGmBsBaseOffsetPart2 = rowOuterIdx * tilingData->stage2RowFactor *
-                tilingData->hcMult * tilingData->d;
                 int64_t curRowFactor = (rowOuterIdx == rowOuterLoop - 1) ? tailRowFactor : tilingData->stage2RowFactor;
                 squareSumOutLocal = squareSumQue.AllocTensor<float>();
                 //todo
@@ -393,7 +530,13 @@ int64_t curBsIdxForAll = (stage2BlockIdx * tilingData->rowLoopOfFormerBlock +
                 PipeBarrier<PIPE_V>();
                 Div(rsqrtSlice, rowBrcbLocal0, rsqrtSlice, curRowFactor);
                 PipeBarrier<PIPE_V>();
+                squareSumQue.template FreeTensor(squareSumOutLocal);
+            }
 
+            // ===== [simopt10 B] phase 2a: pre + A-stage 对角行 + post (y 卸载给 AIC) =====
+            for (int64_t rowOuterIdx = 0; rowOuterIdx < rowOuterLoop; rowOuterIdx++) {
+                int64_t curRowFactor = (rowOuterIdx == rowOuterLoop - 1) ? tailRowFactor : tilingData->stage2RowFactor;
+                LocalTensor<float> rsqrtSlice = rsqrtAllLocal[rowOuterIdx * rsqrtSlotStride];
                 mixes01Local = mixesQue01.AllocTensor<float>();
 
                 uint64_t mixBaseOffset = workspaceSize1 +
@@ -417,28 +560,30 @@ int64_t curBsIdxForAll = (stage2BlockIdx * tilingData->rowLoopOfFormerBlock +
                 ProcessPre(mixes01ReduceLocal, mixes01ReduceLocal, hcBase0Local, rsqrtSlice,
                 rowBrcbLocal0, hcBrcbLocal1, hcScaleGm.GetValue(0), tilingData->hcEps,
                 curRowFactor, tilingData->hcMult);
-                for (int64_t dLoopIdx = 0; dLoopIdx < tilingData->dLoop; dLoopIdx++) {
-                    int64_t curDFactor =
-                        (dLoopIdx == tilingData->dLoop - 1) ? tilingData->tailDFactor : tilingData->dFactor;
-                    xLocal = xQue.template AllocTensor<T>();
-                    CopyIn(xGm[xGmBlockBaseOffsetPart2 + xGmBsBaseOffsetPart2 +
-                    dLoopIdx * tilingData->dFactor], xLocal,
-                    tilingData->stage2RowFactor * tilingData->hcMult, curDFactor,
-                    tilingData->d - curDFactor);
-                    xQue.template EnQue(xLocal);
-                    xLocal = xQue.template DeQue<T>();
-                    yLocal = yQue.template AllocTensor<T>();
-                    ProcessY(yLocal, xLocal, mixes01ReduceLocal, hcBrcbLocal1, xCastLocal, yCastLocal, curRowFactor,
-                                tilingData->hcMult, curDFactor);
-                    xQue.template FreeTensor(xLocal);
-                    yQue.template EnQue(yLocal);
-                    yLocal = yQue.template DeQue<T>();
-                    CopyOut(yLocal,
-                        yGm[stage2BlockIdx * tilingData->rowOfFormerBlock * tilingData->d +
-                        rowOuterIdx * tilingData->stage2RowFactor * tilingData->d +
-                        dLoopIdx * tilingData->dFactor],
-                        curRowFactor, curDFactor, tilingData->d - curDFactor);
-                    yQue.template FreeTensor(yLocal);
+                // [simopt10 B] A-stage: 每 token 写 hcMult 个 16-float 对角行,
+                // 行内 [t%16] = pre[t,h], 其余 0。全对齐 vector 构造:
+                // Duplicate(preVal, 16) × Mul(identity[tl]) —— 避免 4B 粒度未对齐
+                // 的 1 元素 Adds 基址(上板地雷, 同 rsqrt 槽位教训)
+                int64_t aStageTokenBase = stage2BlockIdx * tilingData->rowOfFormerBlock +
+                rowOuterIdx * tilingData->stage2RowFactor;
+                for (int64_t r = 0; r < curRowFactor; ++r) {
+                    int64_t t = aStageTokenBase + r;
+                    int64_t g = t / 16;
+                    int64_t tl = t % 16;
+                    aStageLocal = aStageQue.AllocTensor<float>();
+                    for (int64_t h = 0; h < tilingData->hcMult; ++h) {
+                        float preVal = mixes01ReduceLocal.GetValue(r * tilingData->hcMultAlign + h);
+                        Duplicate(aStageBcastLocal, preVal, 16);
+                        PipeBarrier<PIPE_V>();
+                        Mul(aStageLocal[h * 16], aStageBcastLocal, identityLocal[tl * 16], 16);
+                    }
+                    PipeBarrier<PIPE_V>();
+                    aStageQue.EnQue(aStageLocal);
+                    aStageLocal = aStageQue.DeQue<float>();
+                    CopyOut(aStageLocal,
+                            workspaceGm[aStageWsBase + (g * tilingData->hcMult) * 16 * 16 + tl * 16],
+                            tilingData->hcMult, 16, 16 * 16 - 16);
+                    aStageQue.FreeTensor(aStageLocal);
                 }
                 // post
                 postLocal = postQue.AllocTensor<float>();
@@ -454,8 +599,10 @@ int64_t curBsIdxForAll = (stage2BlockIdx * tilingData->rowLoopOfFormerBlock +
                         rowOuterIdx * tilingData->stage2RowFactor * tilingData->hcMult],
                         curRowFactor, tilingData->hcMult);
                 postQue.FreeTensor(postLocal);
-                squareSumQue.template FreeTensor(squareSumOutLocal);
             }
+
+            // ===== [simopt10 B] SyncAll#2: A-stage 就绪, 放行 AIC y-mm =====
+            SyncAll<false>();
 
             // ===== loop 2: comb 按批处理 (K 分片乒乓装载累加 + 批量 softmax/Sinkhorn) =====
             // 累加顺序(切片 0 起, 1..K-1 依序)与原 ReduceSumARAPerf 严格一致, 数值逐位等价;
@@ -551,6 +698,59 @@ int64_t curBsIdxForAll = (stage2BlockIdx * tilingData->rowLoopOfFormerBlock +
                 }
                 combFragQue.FreeTensor(combFragLocal);
             }
+
+            // ===== [simopt10 B] SyncAll#3: AIC y-mm 完成后汇合, AIV 开始 y 回读 =====
+            SyncAll<false>();
+
+            // ===== [simopt10 B] phase 2b: y 回读 (yFp32Ws fp32 → cast bf16 → yGm) =====
+            for (int64_t rowOuterIdx = 0; rowOuterIdx < rowOuterLoop; rowOuterIdx++) {
+                int64_t curRowFactor = (rowOuterIdx == rowOuterLoop - 1) ? tailRowFactor : tilingData->stage2RowFactor;
+                int64_t yTokenBase = stage2BlockIdx * tilingData->rowOfFormerBlock +
+                rowOuterIdx * tilingData->stage2RowFactor;
+                for (int64_t r = 0; r < curRowFactor; ++r) {
+                    int64_t t = yTokenBase + r;
+                    CopyIn(workspaceGm[yFp32WsBase + t * tilingData->d], xCastLocal, 1,
+                    tilingData->d);
+                    event_t yCastEvent = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::MTE2_V));
+                    SetFlag<HardEvent::MTE2_V>(yCastEvent);
+                    WaitFlag<HardEvent::MTE2_V>(yCastEvent);
+                    yLocal = yQue.template AllocTensor<T>();
+                    CastTwoDim(yLocal, xCastLocal, 1, tilingData->d);
+                    yQue.template EnQue(yLocal);
+                    yLocal = yQue.template DeQue<T>();
+                    CopyOut(yLocal, yGm[t * tilingData->d], 1, tilingData->d, 0);
+                    yQue.template FreeTensor(yLocal);
+                }
+            }
+        } else {
+            // [simopt10 B] AIC: 等 A-stage 就绪(#2)后执行 y-mm, 完成后 #3 汇合
+            SyncAll<false>();
+            int64_t stage1UsedCoreNum = tilingData->cubeBlockDimK;
+            int64_t mmLastAxisSize = CeilAlign(tilingData->hcMix, MM_CACHE_LINE_BYTES / sizeof(float));
+            int64_t xCastFp32BufSize = tilingData->mL1Size *
+            CeilAlign(tilingData->cvLoopKSize, MM_CACHE_LINE_BYTES / sizeof(float));
+            int64_t workspaceSize1 = tilingData->cubeCoreNum * DOUBLE_BUFFER * xCastFp32BufSize;
+            int64_t workspaceSize2 = CeilAlign(stage1UsedCoreNum * tilingData->bs *
+            mmLastAxisSize * sizeof(float), WORKSPACE_ALIGN_SIZE) / sizeof(float);
+            int64_t wsSquareSum = CeilAlign(stage1UsedCoreNum * SQUARE_SUM_SIZE *
+            CeilAlign(tilingData->bs, SQUARE_SUM_SIZE) * sizeof(float), WORKSPACE_ALIGN_SIZE) /
+            sizeof(float);
+            int64_t xTWsBase = workspaceSize1 + workspaceSize2 + wsSquareSum;
+            int64_t xTWsSize = CeilAlign(tilingData->hcMult * tilingData->d * tilingData->bs *
+            sizeof(float), WORKSPACE_ALIGN_SIZE) / sizeof(float);
+            int64_t aStageBase = xTWsBase + xTWsSize;
+            int64_t aStageSizeF = CeilDiv(tilingData->bs, 16) * tilingData->hcMult * 16 * 16;
+            int64_t yFp32Base = aStageBase +
+                CeilAlign(aStageSizeF * sizeof(float), WORKSPACE_ALIGN_SIZE) / sizeof(float);
+            if (ENABLE_Y_MM) {   // [DEBUG bisect] y-mm 开关
+                cubeCompute2_.ComputeY(workspaceGm[aStageBase], workspaceGm[xTWsBase],
+                workspaceGm[yFp32Base], CeilDiv(tilingData->bs, 16), tilingData->d,
+                tilingData->bs, tilingData->cubeCoreNum);
+            }
+            // [simopt10 B] 必须消费 Init 武装的 L1/L0 事件旗标, 否则内核退出时
+            // 残留武装计数器触发 teardown DBI 风暴(非确定复现)
+            cubeCompute2_.End();
+            SyncAll<false>();
         }
     }
 
@@ -575,6 +775,17 @@ private:
     TQue<QuePosition::VECOUT, 1> combFragQue;
 
     TQue<QuePosition::VECIN, 1> squareSumQue;
+
+    // [simopt10 B] A-stage 对角行暂存队列 + Part2 AIC y-mm
+    TQue<QuePosition::VECOUT, 1> aStageQue;
+    LocalTensor<float> aStageLocal;
+    TBuf<QuePosition::VECCALC> identityBuf;     // [simopt10 B] 16×16 单位阵(行主序)
+    LocalTensor<float> identityLocal;
+    TBuf<QuePosition::VECCALC> aStageBcastBuf;  // [simopt10 B] 16 元广播暂存
+    LocalTensor<float> aStageBcastLocal;
+    HcCubeCompute<false> cubeCompute2_;
+    // [DEBUG bisect] y-mm 开关
+    static constexpr bool ENABLE_Y_MM = true;
 
     // [simopt8] comb 批处理: 单批最多批 11 行(UB 增量 ~7KB, 要求 rowFactor=1 类
     // shape 的 Part2 slack >= ~8KB; d=4096 全系 shape 满足。更紧的 shape 需把该值
