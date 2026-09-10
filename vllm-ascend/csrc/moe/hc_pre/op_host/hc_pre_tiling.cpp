@@ -291,7 +291,8 @@ ge::graphStatus HcPreTiling::CalcOpTiling() {
     tilingData_.set_kL1Size(std::min(A_L1_SIZE / tilingData_.get_mL1Size(),
     static_cast<uint64_t>(K_L1_MAX_SIZE)) / K_L1_ALIGN_SIZE * K_L1_ALIGN_SIZE);
 
-    tilingData_.set_cvLoopKSize(1024);
+    // [simopt10 B] 256: cast tile 变 (stage1MFactor, 256), 可拆连续 (16,256) 子块做转置产 xT
+    tilingData_.set_cvLoopKSize(256);
 
     // vector stage1 tiling
     tilingData_.set_cubeCoreNum(static_cast<int64_t>(aicCoreNum_));
@@ -299,6 +300,8 @@ ge::graphStatus HcPreTiling::CalcOpTiling() {
     // exit node 1 b16 input Queue and 1 b32 output Queue
     int64_t lineByteSize = (sizeof(int16_t) + sizeof(int32_t)) * DOUBLE_BUFFER * tilingData_.get_cvLoopKSize();
     int64_t stage1MFactorValue = ubSize_ / lineByteSize;
+    // [simopt10 B] 钳到 32: (32,256) tile = 2 个连续 (16,256) 转置子块, xT 暂存 16KB/槽可控
+    stage1MFactorValue = stage1MFactorValue > 32 ? 32 : stage1MFactorValue;
     tilingData_.set_stage1MFactor(stage1MFactorValue);
     return CalcMKSplitCoreMembasePart2Tiling();
 }
@@ -331,6 +334,8 @@ ge::graphStatus HcPreTiling::DoOpTiling()
 
 ge::graphStatus HcPreTiling::GetWorkspaceSize()
 {
+    // [simopt10 B] ws 布局: xCast乒乓 | mmOut(全24列) | squareSum | xT((h,d,t)转置副本)
+    //               | A-stage(对角行) | yFp32(AIC y-mm 输出)
     uint64_t xCastFp32BufSize = tilingData_.get_mL1Size() * RoundUp(tilingData_.get_cvLoopKSize(), 128);
     uint64_t workspaceSize1 = tilingData_.get_cubeCoreNum() * DOUBLE_BUFFER * xCastFp32BufSize * sizeof(float);
 
@@ -341,7 +346,16 @@ ge::graphStatus HcPreTiling::GetWorkspaceSize()
     uint64_t squareSumSize = RoundUp(tilingData_.get_cubeBlockDimK() *
     RoundUp(tilingData_.get_bs(), 16) * 16 * sizeof(float), 512);
 
-    uint64_t requiredSize = workspaceSize1 + workspaceSize2 + squareSumSize + 16 * 1024 * 1024; // 16MB 预留缓冲
+    uint64_t xTSize = RoundUp(tilingData_.get_hcMult() * tilingData_.get_d() *
+    tilingData_.get_bs() * sizeof(float), 512);
+
+    uint64_t aStageSize = RoundUp((tilingData_.get_bs() + 15) / 16 * tilingData_.get_hcMult() *
+    16 * 16 * sizeof(float), 512);
+
+    uint64_t yFp32Size = RoundUp(tilingData_.get_bs() * tilingData_.get_d() * sizeof(float), 512);
+
+    uint64_t requiredSize = workspaceSize1 + workspaceSize2 + squareSumSize + xTSize + aStageSize +
+    yFp32Size + 16 * 1024 * 1024; // 16MB 预留缓冲
 
     uint64_t defaultSize = 16 * 1024 * 1024 + 192 * 1024 * 1024; // 208MB
     workspaceSize_ = requiredSize > defaultSize ? requiredSize : defaultSize;
