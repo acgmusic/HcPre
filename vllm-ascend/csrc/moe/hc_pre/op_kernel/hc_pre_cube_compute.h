@@ -207,7 +207,9 @@ __aicore__ inline void HC_PRE_CUBE_COMPUTE_TEMPLATE_CLASS::ComputeY(
     // 每 (g, dTile) 按 h=0..3 顺序累加(与 AIV 逐行 ReduceSumARAPerf 的 h 序一致),
     // 然后 Fixpipe nz2nd 一次写出。Y_N_TILE 为粒度棘轮常量(256 → 64 → 16 逐级回退)
     constexpr uint64_t Y_N_TILE = 256;
-    constexpr uint64_t Y_EVT = 6;          // ComputeY 专用事件 id (各 HardEvent 类型独立编号)
+    constexpr uint64_t Y_EVT = 7;          // ComputeY 专用事件 id; 注意避开 M_MTE1 的
+                                           // L0B 槽位 id 5/6(Init 武装), 各 HardEvent
+                                           // 类型独立编号, 7 在 MTE1_M/MTE2_MTE1/M_MTE1 均空闲
     uint64_t blkIdx = static_cast<uint64_t>(GetBlockIdx());
     for (uint64_t g = blkIdx; g < groupNum; g += coreNum) {
         for (uint64_t dTile = 0; dTile < dSize; dTile += Y_N_TILE) {

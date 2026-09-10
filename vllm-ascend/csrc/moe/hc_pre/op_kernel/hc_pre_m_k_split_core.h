@@ -207,34 +207,20 @@ public:
     }
 
 private:
-    // [simopt10 B] 构造 Gather 转置的 offsets(字节单位), 全 vector 指令 + 字面量标量,
-    // 无标量写 UB(规避 S→V 可见性问题)。模式: 64 元素/repeat, repeat r 相对 repeat 0
-    // 字节偏移 +16r; repeat 0 内 16k+j = j*realK*4 + k*4
+    // [simopt10 B] 构造 Gather 转置的 offsets(字节单位, 对所有子块相同)。
+    // 目标: dst[i] = src[off[i]/4], i = 64r + 16q + t (r=repeat, q∈[0,4), t∈[0,16)),
+    // off[i] = t*realK*4 + (4r+q)*4 = P[16q+t] + 16r, 其中 P[16q+t] = t*realK*4 + q*4。
+    // 实现: 标量 SetValue 建 64 元模式 P(小表一次性, 模式同 CANN arithprogression),
+    // S_V 同步后用对齐 Adds 复制 63 个 repeat 块 —— 全程无 4B 粒度未对齐的 VEC 基址
     __aicore__ inline void BuildGatherOffsets()
     {
-        uint32_t elemBytes = sizeof(float);
-        uint32_t rowBytes = TRANSPOSE_SUB_W * elemBytes;   // realK=256 → 1024B
-        // iota16 于 offsets[0..16): 倍增链 [0]→[0,1]→[0..3]→[0..7]→[0..15]
-        Duplicate(gatherOffsetsLocal, static_cast<uint32_t>(0), 1);
-        PipeBarrier<PIPE_V>();
-        Adds(gatherOffsetsLocal[1], gatherOffsetsLocal, static_cast<uint32_t>(1), 1);
-        PipeBarrier<PIPE_V>();
-        Adds(gatherOffsetsLocal[2], gatherOffsetsLocal, static_cast<uint32_t>(2), 2);
-        PipeBarrier<PIPE_V>();
-        Adds(gatherOffsetsLocal[4], gatherOffsetsLocal, static_cast<uint32_t>(4), 4);
-        PipeBarrier<PIPE_V>();
-        Adds(gatherOffsetsLocal[8], gatherOffsetsLocal, static_cast<uint32_t>(8), 8);
-        PipeBarrier<PIPE_V>();
-        // c16[j] = j * rowBytes
-        Muls(gatherOffsetsLocal, gatherOffsetsLocal, rowBytes, 16);
-        PipeBarrier<PIPE_V>();
-        // repeat-0 的 64 项: [16k+j] = c16[j] + k*elemBytes
-        for (uint32_t k = 1; k < 4; ++k) {
-            Adds(gatherOffsetsLocal[16 * k], gatherOffsetsLocal,
-                 k * elemBytes, 16);
-            PipeBarrier<PIPE_V>();
+        uint32_t rowBytes = TRANSPOSE_SUB_W * sizeof(float);
+        for (uint32_t q = 0; q < 4; ++q) {
+            for (uint32_t t = 0; t < 16; ++t) {
+                gatherOffsetsLocal.SetValue(16 * q + t, t * rowBytes + q * sizeof(float));
+            }
         }
-        // 63 个后续 repeat: 相对 repeat-0 字节偏移 +16r (d 每组 +4 → ×4B)
+        ScalarToVectorSync();
         for (uint32_t r = 1; r < 64; ++r) {
             Adds(gatherOffsetsLocal[64 * r], gatherOffsetsLocal, 16 * r, 64);
             PipeBarrier<PIPE_V>();
@@ -305,7 +291,7 @@ private:
     static constexpr uint64_t TRANSPOSE_SUB_W = 256;  // 与 cvLoopKSize 对应的子块宽
     static constexpr uint64_t TRANSPOSE_CSIZE = 16;   // 转置 C 维 (= 转置的 token 行数)
     // [DEBUG bisect] 转置路线开关: true=Transpose 增强接口(板), false=Gather offsets(sim/板)
-    static constexpr bool ENABLE_XT_TRANSPOSE = false;
+    static constexpr bool ENABLE_XT_TRANSPOSE = true;
     static constexpr bool ENABLE_V4DTRANS = false;
 
     LocalTensor<T> xLocal;
@@ -449,7 +435,18 @@ public:
         InitTBufBuffers(xQueNum2);
         // [simopt10 B] A-stage 对角行暂存 (hcMult × 16 float, V→MTE3 由队列同步)
         pipe->InitBuffer(aStageQue, NUM_TWO, tilingData->hcMult * 16 * sizeof(float));
+        // [simopt10 B] 16×16 单位阵(行主序, 供 A-stage 对角行 Mul)+ 16 元广播暂存
+        pipe->InitBuffer(identityBuf, 16 * 16 * sizeof(float));
+        pipe->InitBuffer(aStageBcastBuf, 16 * sizeof(float));
         GetLocalTensors();
+        identityLocal = identityBuf.Get<float>();
+        aStageBcastLocal = aStageBcastBuf.Get<float>();
+        for (int64_t tl = 0; tl < 16; ++tl) {
+            for (int64_t j = 0; j < 16; ++j) {
+                identityLocal.SetValue(tl * 16 + j, tl == j ? 1.0f : 0.0f);
+            }
+        }
+        ScalarToVectorSync();
     }
     __aicore__ inline void Process()
     {
@@ -564,7 +561,9 @@ int64_t curBsIdxForAll = (stage2BlockIdx * tilingData->rowLoopOfFormerBlock +
                 rowBrcbLocal0, hcBrcbLocal1, hcScaleGm.GetValue(0), tilingData->hcEps,
                 curRowFactor, tilingData->hcMult);
                 // [simopt10 B] A-stage: 每 token 写 hcMult 个 16-float 对角行,
-                // 行内 [t%16] = pre[t,h], 其余 0 (全 vector 构造: Duplicate + 1 元素 Adds)
+                // 行内 [t%16] = pre[t,h], 其余 0。全对齐 vector 构造:
+                // Duplicate(preVal, 16) × Mul(identity[tl]) —— 避免 4B 粒度未对齐
+                // 的 1 元素 Adds 基址(上板地雷, 同 rsqrt 槽位教训)
                 int64_t aStageTokenBase = stage2BlockIdx * tilingData->rowOfFormerBlock +
                 rowOuterIdx * tilingData->stage2RowFactor;
                 for (int64_t r = 0; r < curRowFactor; ++r) {
@@ -572,11 +571,11 @@ int64_t curBsIdxForAll = (stage2BlockIdx * tilingData->rowLoopOfFormerBlock +
                     int64_t g = t / 16;
                     int64_t tl = t % 16;
                     aStageLocal = aStageQue.AllocTensor<float>();
-                    Duplicate(aStageLocal, static_cast<float>(0.0f), tilingData->hcMult * 16);
-                    PipeBarrier<PIPE_V>();
                     for (int64_t h = 0; h < tilingData->hcMult; ++h) {
                         float preVal = mixes01ReduceLocal.GetValue(r * tilingData->hcMultAlign + h);
-                        Adds(aStageLocal[h * 16 + tl], aStageLocal[h * 16 + tl], preVal, 1);
+                        Duplicate(aStageBcastLocal, preVal, 16);
+                        PipeBarrier<PIPE_V>();
+                        Mul(aStageLocal[h * 16], aStageBcastLocal, identityLocal[tl * 16], 16);
                     }
                     PipeBarrier<PIPE_V>();
                     aStageQue.EnQue(aStageLocal);
@@ -748,6 +747,9 @@ int64_t curBsIdxForAll = (stage2BlockIdx * tilingData->rowLoopOfFormerBlock +
                 workspaceGm[yFp32Base], CeilDiv(tilingData->bs, 16), tilingData->d,
                 tilingData->bs, tilingData->cubeCoreNum);
             }
+            // [simopt10 B] 必须消费 Init 武装的 L1/L0 事件旗标, 否则内核退出时
+            // 残留武装计数器触发 teardown DBI 风暴(非确定复现)
+            cubeCompute2_.End();
             SyncAll<false>();
         }
     }
@@ -777,9 +779,13 @@ private:
     // [simopt10 B] A-stage 对角行暂存队列 + Part2 AIC y-mm
     TQue<QuePosition::VECOUT, 1> aStageQue;
     LocalTensor<float> aStageLocal;
+    TBuf<QuePosition::VECCALC> identityBuf;     // [simopt10 B] 16×16 单位阵(行主序)
+    LocalTensor<float> identityLocal;
+    TBuf<QuePosition::VECCALC> aStageBcastBuf;  // [simopt10 B] 16 元广播暂存
+    LocalTensor<float> aStageBcastLocal;
     HcCubeCompute<false> cubeCompute2_;
     // [DEBUG bisect] y-mm 开关
-    static constexpr bool ENABLE_Y_MM = false;
+    static constexpr bool ENABLE_Y_MM = true;
 
     // [simopt8] comb 批处理: 单批最多批 11 行(UB 增量 ~7KB, 要求 rowFactor=1 类
     // shape 的 Part2 slack >= ~8KB; d=4096 全系 shape 满足。更紧的 shape 需把该值
