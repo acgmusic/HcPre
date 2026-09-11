@@ -3,3 +3,4 @@
 sim_out/
 *.emmx
 *.eddx
+vllm-ascend-bak/
