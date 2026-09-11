@@ -79,6 +79,15 @@ __aicore__ inline void ScalarToVectorSync()
     WaitFlag<HardEvent::S_V>(eventIdSToV);
 }
 
+// [simopt10 B] 向量写 UB 后的可见性屏障(标量读取前调用)。
+// SetFlag<V_S> 在 VECTOR 管排队(排空前序向量写), WaitFlag 阻塞 SCALAR 读
+__aicore__ inline void VectorToScalarSync()
+{
+    event_t eventIdVToS = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::V_S));
+    SetFlag<HardEvent::V_S>(eventIdVToS);
+    WaitFlag<HardEvent::V_S>(eventIdVToS);
+}
+
 __aicore__ inline void GatherMaskByDiagonal(const LocalTensor<float>& output, const LocalTensor<float>& input,
                                             const LocalTensor<uint32_t> maskPattern, uint16_t dim0)
 {

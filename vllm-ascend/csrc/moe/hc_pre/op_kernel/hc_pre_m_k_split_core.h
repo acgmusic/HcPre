@@ -202,6 +202,13 @@ public:
         } else {
             CrossCoreWaitFlag(SYNC_AIC_TO_AIV_FLAG);
             CrossCoreWaitFlag(SYNC_AIC_TO_AIV_FLAG);
+            // [simopt10 B] 等 MTE3 排空: 尾拖转置的 xT CopyOut 仍在 MTE3 队列里
+            // (实测 busy ~64µs), 若不等, Part2 重分配同一 UB 后 phase2a 的向量写
+            // 会在 MTE3 读取前打穿 transLocal 槽 → xT 内容被污染(identity 影子,
+            // 串行 dump 实测确认)。SetFlag 排在 MTE3 管上, WaitFlag 阻塞标量退出
+            event_t mte3DrainEvt = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::MTE3_MTE2));
+            SetFlag<HardEvent::MTE3_MTE2>(mte3DrainEvt);
+            WaitFlag<HardEvent::MTE3_MTE2>(mte3DrainEvt);
         }
         SyncAll<false>(); // cv全部同步
     }
@@ -210,19 +217,21 @@ private:
     // [simopt10 B] 构造 Gather 转置的 offsets(字节单位, 对所有子块相同)。
     // 目标: dst[i] = src[off[i]/4], i = 64r + 16q + t (r=repeat, q∈[0,4), t∈[0,16)),
     // off[i] = t*realK*4 + (4r+q)*4 = P[16q+t] + 16r, 其中 P[16q+t] = t*realK*4 + q*4。
-    // 实现: 标量 SetValue 建 64 元模式 P(小表一次性, 模式同 CANN arithprogression),
-    // S_V 同步后用对齐 Adds 复制 63 个 repeat 块 —— 全程无 4B 粒度未对齐的 VEC 基址
+    // 实现: 标量 SetValue 建 64 元模式 P, S_V 同步后用对齐 Adds 复制 63 个 repeat 块。
+    // 注意: Adds 在 dav_c220 不支持 uint32 —— 构造用 int32 视图, 值域 [0,16380)
+    // 位模式与 uint32 等价, Gather 调用时 ReinterpretCast 回 uint32
     __aicore__ inline void BuildGatherOffsets()
     {
-        uint32_t rowBytes = TRANSPOSE_SUB_W * sizeof(float);
-        for (uint32_t q = 0; q < 4; ++q) {
-            for (uint32_t t = 0; t < 16; ++t) {
-                gatherOffsetsLocal.SetValue(16 * q + t, t * rowBytes + q * sizeof(float));
+        int32_t rowBytes = static_cast<int32_t>(TRANSPOSE_SUB_W * sizeof(float));
+        LocalTensor<int32_t> offsetsI32 = gatherOffsetsLocal.ReinterpretCast<int32_t>();
+        for (int32_t q = 0; q < 4; ++q) {
+            for (int32_t t = 0; t < 16; ++t) {
+                offsetsI32.SetValue(16 * q + t, t * rowBytes + q * static_cast<int32_t>(sizeof(float)));
             }
         }
         ScalarToVectorSync();
-        for (uint32_t r = 1; r < 64; ++r) {
-            Adds(gatherOffsetsLocal[64 * r], gatherOffsetsLocal, 16 * r, 64);
+        for (int32_t r = 1; r < 64; ++r) {
+            Adds(offsetsI32[64 * r], offsetsI32, 16 * r, 64);
             PipeBarrier<PIPE_V>();
         }
     }
@@ -563,7 +572,10 @@ int64_t curBsIdxForAll = (stage2BlockIdx * tilingData->rowLoopOfFormerBlock +
                 // [simopt10 B] A-stage: 每 token 写 hcMult 个 16-float 对角行,
                 // 行内 [t%16] = pre[t,h], 其余 0。全对齐 vector 构造:
                 // Duplicate(preVal, 16) × Mul(identity[tl]) —— 避免 4B 粒度未对齐
-                // 的 1 元素 Adds 基址(上板地雷, 同 rsqrt 槽位教训)
+                // 的 1 元素 Adds 基址(上板地雷, 同 rsqrt 槽位教训)。
+                // GetValue 为 SCALAR 读, 必须先做 V→S 可见性同步(否则读到
+                // ProcessPre 落盘前的原始 mix 值 — 串行 dump 实测确认)
+                VectorToScalarSync();
                 int64_t aStageTokenBase = stage2BlockIdx * tilingData->rowOfFormerBlock +
                 rowOuterIdx * tilingData->stage2RowFactor;
                 for (int64_t r = 0; r < curRowFactor; ++r) {
@@ -703,6 +715,25 @@ int64_t curBsIdxForAll = (stage2BlockIdx * tilingData->rowLoopOfFormerBlock +
             SyncAll<false>();
 
             // ===== [simopt10 B] phase 2b: y 回读 (yFp32Ws fp32 → cast bf16 → yGm) =====
+            if (ENABLE_DUMP_WS && stage2BlockIdx == 0) {
+                // [DEBUG] 调试转储: 把 aStage 前 16 组 tile 与 xT h=0 前 32 行写入 yFp32,
+                // 经下方正常回读路径从 y 输出。y[0..3] 行 = aStage, y[4..7] 行 = xT
+                for (int64_t chunk = 0; chunk < NUM_TWO; ++chunk) {
+                    CopyIn(workspaceGm[aStageWsBase + chunk * 8192], xCastLocal, 8, 1024);
+                    event_t dEvt = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::MTE2_V));
+                    SetFlag<HardEvent::MTE2_V>(dEvt);
+                    WaitFlag<HardEvent::MTE2_V>(dEvt);
+                    CopyOut(xCastLocal, workspaceGm[yFp32WsBase + chunk * 8192], 8, 1024, 0);
+                }
+                for (int64_t chunk = 0; chunk < NUM_TWO; ++chunk) {
+                    // xT 区在 aStage 区之前 wsXT 个 float
+                    CopyIn(workspaceGm[aStageWsBase - wsXT + chunk * 8192], xCastLocal, 8, 1024);
+                    event_t dEvt = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::MTE2_V));
+                    SetFlag<HardEvent::MTE2_V>(dEvt);
+                    WaitFlag<HardEvent::MTE2_V>(dEvt);
+                    CopyOut(xCastLocal, workspaceGm[yFp32WsBase + 16384 + chunk * 8192], 8, 1024, 0);
+                }
+            }
             for (int64_t rowOuterIdx = 0; rowOuterIdx < rowOuterLoop; rowOuterIdx++) {
                 int64_t curRowFactor = (rowOuterIdx == rowOuterLoop - 1) ? tailRowFactor : tilingData->stage2RowFactor;
                 int64_t yTokenBase = stage2BlockIdx * tilingData->rowOfFormerBlock +
@@ -786,6 +817,8 @@ private:
     HcCubeCompute<false> cubeCompute2_;
     // [DEBUG bisect] y-mm 开关
     static constexpr bool ENABLE_Y_MM = true;
+    // [DEBUG] 工作区转储开关: phase2b 把 aStage/xT 写进 yFp32 经 y 输出(需 ENABLE_Y_MM=false)
+    static constexpr bool ENABLE_DUMP_WS = false;
 
     // [simopt8] comb 批处理: 单批最多批 11 行(UB 增量 ~7KB, 要求 rowFactor=1 类
     // shape 的 Part2 slack >= ~8KB; d=4096 全系 shape 满足。更紧的 shape 需把该值
