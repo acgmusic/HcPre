@@ -1,0 +1,27 @@
+# Normalize all text files to LF in the working tree (eol=lf) so the
+# docker sync no longer needs CRLF-fixup (sed) that bumps mtimes and
+# defeats ninja incremental rebuilds inside the container.
+* text=auto eol=lf
+
+# Binary assets - never normalize
+*.pt binary
+*.bin binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.zip binary
+*.gz binary
+*.tgz binary
+*.tar binary
+*.xz binary
+*.7z binary
+*.whl binary
+*.onnx binary
+*.emmx binary
+*.eddx binary
+*.so binary
+*.o binary
+*.a binary

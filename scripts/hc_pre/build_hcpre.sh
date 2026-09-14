@@ -49,7 +49,7 @@ EOS
 
 build() {
   step "1/3 sync workspace into container"
-  bash "$SCRIPT_DIR/sync_repo.sh"
+  bash "$SCRIPT_DIR/../sync_repo.sh"
 
   step "2/3 build hc_pre op run package (soc=$BUILD_SOC)"
   docker exec -i "$C" bash -s <<EOS

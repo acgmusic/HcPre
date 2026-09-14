@@ -5,9 +5,14 @@
  * dumps hin/hPost/hRes for comparison against hc_pre's y/post/comb_frag.
  *
  * Output bin layout: [code=0:int64][bs,n,d:int64x3][hin bf16][hPost fp32][hRes fp32 (n*n per row)]
+ *
+ * Device selection: env NPU_ID selects the card under test (default 0).
+ * Perf loop: env MHCS_ITERS selects the number of op launches (default 1);
+ * each launch yields an independent Task Duration sample in msprof op_summary.
  */
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <vector>
 #include "acl/acl.h"
 #include "aclnn_mhc_pre_sinkhorn.h"
@@ -113,10 +118,18 @@ int main(int argc, char **argv)
            (long)mixHc, (long)numIters);
     fflush(stdout);
 
+    // Device selection: NPU_ID env var picks the card under test; unset/empty -> card 0.
+    const char *npuIdEnv = getenv("NPU_ID");
+    int32_t deviceId = (npuIdEnv != nullptr) ? static_cast<int32_t>(atoi(npuIdEnv)) : 0;
+    printf("[mhcs-ex] using NPU device %d\n", static_cast<int>(deviceId));
+    fflush(stdout);
+
     ret = static_cast<aclnnStatus>(aclInit(nullptr));
     CHECK_RET(ret == ACL_SUCCESS, "aclInit");
+    ret = static_cast<aclnnStatus>(aclrtSetDevice(deviceId));
+    CHECK_RET(ret == ACL_SUCCESS, "aclrtSetDevice");
     aclrtContext ctx; aclrtStream strm;
-    aclrtCreateContext(&ctx, 0);
+    aclrtCreateContext(&ctx, deviceId);
     aclrtCreateStream(&strm);
 
     void *xDev = nullptr, *phiDev = nullptr, *alphaDev = nullptr, *biasDev = nullptr;
@@ -147,22 +160,34 @@ int main(int argc, char **argv)
     MakeOut(soShape, ACL_FLOAT, 4, soDev, sumOut);
     MakeOut(noShape, ACL_FLOAT, 4, noDev, normOut);
 
-    uint64_t wsSize = 0;
-    aclOpExecutor *exec = nullptr;
-    printf("[mhcs-ex] before getWs\n"); fflush(stdout);
-    ret = aclnnMhcPreSinkhornGetWorkspaceSize(x, phi, alpha, bias,
-                                              n /*hcMult*/, numIters, 1e-6 /*hcEps*/, 1e-6 /*normEps*/,
-                                              false /*needBackward*/,
-                                              hin, hPost, hRes, hPre, hcBeforeNorm, invRms, sumOut, normOut,
-                                              &wsSize, &exec);
-    printf("[mhcs-ex] getWs rc=%d ws=%lu\n", (int)ret, (unsigned long)wsSize); fflush(stdout);
-    CHECK_RET(ret == ACL_SUCCESS, "GetWorkspaceSize");
+    const char *itersEnv = getenv("MHCS_ITERS");
+    int numLaunches = (itersEnv != nullptr) ? atoi(itersEnv) : 1;
+    if (numLaunches < 1) { numLaunches = 1; }
+    printf("[mhcs-ex] launches=%d\n", numLaunches); fflush(stdout);
 
     void *ws = nullptr;
-    if (wsSize > 0) { aclrtMalloc(&ws, wsSize, ACL_MEM_MALLOC_NORMAL_ONLY); }
-    ret = aclnnMhcPreSinkhorn(ws, wsSize, exec, strm);
-    printf("[mhcs-ex] run rc=%d\n", (int)ret); fflush(stdout);
-    CHECK_RET(ret == ACL_SUCCESS, "aclnnMhcPreSinkhorn");
+    uint64_t wsCap = 0;
+    for (int it = 0; it < numLaunches; ++it) {
+        uint64_t wsSize = 0;
+        aclOpExecutor *exec = nullptr;
+        ret = aclnnMhcPreSinkhornGetWorkspaceSize(x, phi, alpha, bias,
+                                                  n /*hcMult*/, numIters, 1e-6 /*hcEps*/, 1e-6 /*normEps*/,
+                                                  false /*needBackward*/,
+                                                  hin, hPost, hRes, hPre, hcBeforeNorm, invRms, sumOut, normOut,
+                                                  &wsSize, &exec);
+        if (it == 0) {
+            printf("[mhcs-ex] getWs rc=%d ws=%lu\n", (int)ret, (unsigned long)wsSize); fflush(stdout);
+        }
+        CHECK_RET(ret == ACL_SUCCESS, "GetWorkspaceSize");
+        if (wsSize > wsCap) {
+            if (ws != nullptr) { aclrtFree(ws); }
+            if (wsSize > 0) { aclrtMalloc(&ws, wsSize, ACL_MEM_MALLOC_NORMAL_ONLY); }
+            wsCap = wsSize;
+        }
+        ret = aclnnMhcPreSinkhorn(ws, wsSize, exec, strm);
+        CHECK_RET(ret == ACL_SUCCESS, "aclnnMhcPreSinkhorn");
+    }
+    printf("[mhcs-ex] run rc=%d launches=%d\n", (int)ret, numLaunches); fflush(stdout);
     aclrtSynchronizeStream(strm);
     printf("[mhcs-ex] synced\n"); fflush(stdout);
 

@@ -1,12 +1,29 @@
 #!/bin/bash
-# Sync the local HcPre workspace (D:\proj\HcPre) into the docker cann container.
-# Local Windows files are the single source of truth; container copy is overwritten each sync.
-# CRLF -> LF normalization is applied (Windows checkout breaks bash scripts otherwise).
+# Sync the local HcPre workspace into the docker cann container.
+# Only meaningful when docker + the target container are available (WSL host).
+# In bare-metal / remote-container scenarios this script is a no-op (docker
+# missing or container absent), because the code is already in place.
 set -euo pipefail
 
 C=${CANN_CONTAINER:-cann_container}
-SRC_ROOT=/mnt/d/proj          # Windows D:\proj
+SRC_ROOT=/mnt/d/proj          # Windows D:\proj (only exists on the WSL host)
 WS=HcPre
+
+# --- docker unavailable: no-op with a clear message (code already local) ---
+if ! command -v docker >/dev/null 2>&1; then
+    echo "[sync] docker not available - skipping sync (code should already be in place)"
+    exit 0
+fi
+# --- container not present: no-op ---
+if ! docker inspect "$C" >/dev/null 2>&1; then
+    echo "[sync] container '$C' not found - skipping sync"
+    exit 0
+fi
+# --- source tree not mounted (not on the WSL host): no-op ---
+if [ ! -d "$SRC_ROOT/$WS" ]; then
+    echo "[sync] $SRC_ROOT/$WS not found (not the WSL host) - skipping sync"
+    exit 0
+fi
 
 docker start "$C" >/dev/null 2>&1 || true
 
