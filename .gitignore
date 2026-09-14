@@ -3,3 +3,6 @@
 sim_out/
 *.emmx
 *.eddx
+
+simopt_logs/
+simopt_logs_backup_*/
