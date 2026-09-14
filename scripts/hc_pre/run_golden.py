@@ -54,18 +54,18 @@ def to_hf32(t):
 
 
 def hc_pre_cpu(x, hc_fn, hc_scale, hc_base):
-    x_float = x.float()
-    x_flat = x_float.flatten(-2)
-    inv_rms = torch.rsqrt(x_flat.square().mean(-1, keepdim=True) + NORM_EPS)
-    mixes = F.linear(to_hf32(x_flat), to_hf32(hc_fn)) * inv_rms
-    pre, post, comb_frag = mixes.split([HC_MULT, HC_MULT, HC_MULT * HC_MULT], dim=-1)
+    x_float = x.float() # [b, s, n, d], cast_bf16_to_fp32
+    x_flat = x_float.flatten(-2) # [b, s, nd], reshape
+    inv_rms = torch.rsqrt(x_flat.square().mean(-1, keepdim=True) + NORM_EPS) # [b, s, 1], 计算RMSNorm缩放因子
+    mixes = F.linear(to_hf32(x_flat), to_hf32(hc_fn)) * inv_rms # [b, s, nd] @ [nd, n*n+2n] * [b, s, 1] = [b, s, n*n+2n], hf32矩阵乘
+    pre, post, comb_frag = mixes.split([HC_MULT, HC_MULT, HC_MULT * HC_MULT], dim=-1) # [b, s, n], [b, s, n], [b, s, n*n]
     
-    comb_frag = comb_frag.unflatten(-1, (HC_MULT, HC_MULT))
-    pre = torch.sigmoid(pre * hc_scale[0] + hc_base[:HC_MULT]) + HC_EPS
-    post = 2 * torch.sigmoid(post * hc_scale[1] + hc_base[HC_MULT : 2 * HC_MULT])
-    comb_frag = comb_frag * hc_scale[2] + hc_base[2 * HC_MULT :].view(HC_MULT, HC_MULT)
-    comb_frag = comb_frag.softmax(-1) + HC_EPS
-    comb_frag = comb_frag / (comb_frag.sum(-2, keepdim=True) + HC_EPS)
+    comb_frag = comb_frag.unflatten(-1, (HC_MULT, HC_MULT)) # [b, s, n, n], 恢复成矩阵形态
+    pre = torch.sigmoid(pre * hc_scale[0] + hc_base[:HC_MULT]) + HC_EPS # [b, s, n], 每个输入流的门控系数
+    post = 2 * torch.sigmoid(post * hc_scale[1] + hc_base[HC_MULT : 2 * HC_MULT]) # [b, s, n], 每个输出流的增益门
+    comb_frag = comb_frag * hc_scale[2] + hc_base[2 * HC_MULT :].view(HC_MULT, HC_MULT) # [b, s, n, n], 对混合矩阵做仿射变换（缩放+偏置）
+    comb_frag = comb_frag.softmax(-1) + HC_EPS # 沿最后一维（每行）softmax → *(b, s, 4, 4)*，每行和≈1；再加 ε 防零
+    comb_frag = comb_frag / (comb_frag.sum(-2, keepdim=True) + HC_EPS) # 每列和≈1
     for _ in range(HC_SINKHORN_ITERS - 1):
         comb_frag = comb_frag / (comb_frag.sum(-1, keepdim=True) + HC_EPS)
         comb_frag = comb_frag / (comb_frag.sum(-2, keepdim=True) + HC_EPS)
