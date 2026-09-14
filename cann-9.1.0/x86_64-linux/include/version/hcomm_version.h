@@ -1,0 +1,12 @@
+#ifndef HCOMM_VERSION_H
+#define HCOMM_VERSION_H
+
+#define HCOMM_VERSION_STR "9.1.0"
+#define HCOMM_MAJOR 9
+#define HCOMM_MINOR 1
+#define HCOMM_PATCH 0
+#define HCOMM_PRERELEASE ""
+#define HCOMM_VERSION_NUM ((9 * 10000000) + (1 * 100000) + (0 * 1000))
+#define HCOMM_TIMESTAMP 0
+
+#endif /* HCOMM_VERSION_H */

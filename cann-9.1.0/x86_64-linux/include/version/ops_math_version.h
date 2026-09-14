@@ -1,0 +1,12 @@
+#ifndef OPS_MATH_VERSION_H
+#define OPS_MATH_VERSION_H
+
+#define OPS_MATH_VERSION_STR "9.1.0"
+#define OPS_MATH_MAJOR 9
+#define OPS_MATH_MINOR 1
+#define OPS_MATH_PATCH 0
+#define OPS_MATH_PRERELEASE ""
+#define OPS_MATH_VERSION_NUM ((9 * 10000000) + (1 * 100000) + (0 * 1000))
+#define OPS_MATH_TIMESTAMP 0
+
+#endif /* OPS_MATH_VERSION_H */

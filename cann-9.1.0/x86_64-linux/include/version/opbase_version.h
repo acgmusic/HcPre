@@ -1,0 +1,12 @@
+#ifndef OPBASE_VERSION_H
+#define OPBASE_VERSION_H
+
+#define OPBASE_VERSION_STR "9.1.0"
+#define OPBASE_MAJOR 9
+#define OPBASE_MINOR 1
+#define OPBASE_PATCH 0
+#define OPBASE_PRERELEASE ""
+#define OPBASE_VERSION_NUM ((9 * 10000000) + (1 * 100000) + (0 * 1000))
+#define OPBASE_TIMESTAMP 0
+
+#endif /* OPBASE_VERSION_H */

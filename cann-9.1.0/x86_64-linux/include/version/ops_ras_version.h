@@ -1,0 +1,12 @@
+#ifndef OPS_RAS_VERSION_H
+#define OPS_RAS_VERSION_H
+
+#define OPS_RAS_VERSION_STR "9.1.0"
+#define OPS_RAS_MAJOR 9
+#define OPS_RAS_MINOR 1
+#define OPS_RAS_PATCH 0
+#define OPS_RAS_PRERELEASE ""
+#define OPS_RAS_VERSION_NUM ((9 * 10000000) + (1 * 100000) + (0 * 1000))
+#define OPS_RAS_TIMESTAMP 0
+
+#endif /* OPS_RAS_VERSION_H */
