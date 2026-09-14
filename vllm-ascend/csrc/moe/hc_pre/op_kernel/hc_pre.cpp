@@ -75,12 +75,23 @@ extern "C" __global__ __aicore__ void hc_pre(GM_ADDR x, GM_ADDR hc_fn, GM_ADDR h
             HcPre::HcPreMembaseKSplitCorePart1<DTYPE_X> op;
             op.Init(x, hc_fn, userWs, tilingData, &pipe);
             op.Process();
+            // [simopt7] 尾部同步拆分: 先收尾本核异步操作(AIC: End; AIV: 排空 MTE3),
+            // 再销毁 Part1 pipe 并完成 Part2 初始化与 hcBase 预取 —— 这些都不依赖
+            // AIC FIXP 输出, 塞进 AIV 等待 AIC 的 ~8us 空闲窗口; 之后再等 FIXP 通知
+            op.FinishCore();
 
             pipe.Destroy();
 
             TPipe pipeStage2;
             HcPre::HcPreMembaseKSplitCorePart2<DTYPE_X> op2;
-            op2.Init(x, hc_scale, hc_base, y, post, comb_frag, userWs, tilingData, &pipeStage2);
+            // [simopt7] Part2 是纯 AIV 阶段: AIC 跳过其 Init/Prefetch(否则这 ~1.3us
+            // 的 TPipe 表操作会串行插入 AIC 的 FIXP 完成 -> SyncAll 关键路径,
+            // 首版实测把屏障从 29.9 推迟到 31.2, 净回退 +0.7us)
+            if ASCEND_IS_AIV {
+                op2.Init(x, hc_scale, hc_base, y, post, comb_frag, userWs, tilingData, &pipeStage2);
+                op2.Prefetch();
+            }
+            op.WaitPeer();
             op2.Process();
 
             pipeStage2.Destroy();
