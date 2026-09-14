@@ -166,9 +166,28 @@ public:
                 cvLoopIdx_++;
             }
         }
+    }
+
+    // [simopt7] 本核异步收尾, 在 pipe.Destroy() 之前调用:
+    //   AIC: 等 cube 内部事件排空(原 Process 尾部的 End());
+    //   AIV: 显式排空本核 MTE3(最后一批 CopyOut + PIPE_MTE3 的 CrossCoreSetFlag 尚可能在飞),
+    //        保证 Destroy 后 UB 重分配不会踩到在飞搬运。基线中该保证来自尾部
+    //        CrossCoreWaitFlag 的间接时序(AIC 计算 ~8us), 此处改为直接等待。
+    __aicore__ inline void FinishCore()
+    {
         if ASCEND_IS_AIC {
             cubeCompute_.End();
         } else {
+            event_t evt = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::MTE3_S));
+            SetFlag<HardEvent::MTE3_S>(evt);
+            WaitFlag<HardEvent::MTE3_S>(evt);
+        }
+    }
+
+    // [simopt7] 尾部跨核等待 + 全核屏障, 在 Part2 初始化/预取之后调用
+    __aicore__ inline void WaitPeer()
+    {
+        if ASCEND_IS_AIV {
             CrossCoreWaitFlag(SYNC_AIC_TO_AIV_FLAG);
             CrossCoreWaitFlag(SYNC_AIC_TO_AIV_FLAG);
         }
@@ -324,6 +343,26 @@ public:
         InitTBufBuffers(xQueNum2);
         GetLocalTensors();
     }
+
+    // [simopt7] AIV 专属预取: hcBase 三个分片的搬运与 MTE2 排空。
+    // 数据只依赖 kernel 输入 hcBaseGm, 与 AIC FIXP 输出无关 —— 提前到
+    // 等待 AIC 通知的空闲窗口(Part1 尾部 ~8us)内完成, 从 Part2 关键路径移除
+    // (基线实测该段 ~1.2us: 发射序列 + 3 条小搬运 + 排空对)。
+    __aicore__ inline void Prefetch()
+    {
+        if ASCEND_IS_AIV {
+            if (GetBlockIdx() >= tilingData->secondUsedCoreNum) {
+                return;
+            }
+            CopyIn(hcBaseGm, hcBase0Local, 1, tilingData->hcMult);
+            CopyIn(hcBaseGm[tilingData->hcMult], hcBase1Local, 1, tilingData->hcMult);
+            CopyIn(hcBaseGm[tilingData->hcMult * NUM_TWO], hcBase2Local, tilingData->hcMult, tilingData->hcMult);
+            event_t eventId = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::MTE2_V));
+            SetFlag<HardEvent::MTE2_V>(eventId);
+            WaitFlag<HardEvent::MTE2_V>(eventId);
+        }
+    }
+
     __aicore__ inline void Process()
     {
         if ASCEND_IS_AIV {
@@ -339,12 +378,7 @@ public:
             int64_t workspaceSize1 = tilingData->cubeCoreNum * DOUBLE_BUFFER * xCastFp32BufSize;
             int64_t workspaceSize2 = CeilAlign(stage1UsedCoreNum * tilingData->bs *
             mmLastAxisSize * sizeof(float), WORKSPACE_ALIGN_SIZE) / sizeof(float);
-            CopyIn(hcBaseGm, hcBase0Local, 1, tilingData->hcMult);
-            CopyIn(hcBaseGm[tilingData->hcMult], hcBase1Local, 1, tilingData->hcMult);
-            CopyIn(hcBaseGm[tilingData->hcMult * NUM_TWO], hcBase2Local, tilingData->hcMult, tilingData->hcMult);
-            event_t eventId = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::MTE2_V));
-            SetFlag<HardEvent::MTE2_V>(eventId);
-            WaitFlag<HardEvent::MTE2_V>(eventId);
+            // [simopt7] hcBase 搬入 + MTE2 排空已前移至 Prefetch()(在 WaitPeer 之前执行)
 
             int64_t rowOuterLoop =
                 (stage2BlockIdx == stage2UsedCoreNum - 1) ?
