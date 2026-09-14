@@ -35,6 +35,13 @@ public:
         pipe = pipePtr;
         tilingData = tilingDataPtr;
 
+        if ASCEND_IS_AIC {
+            // [simopt1] 初始 token 提前到 Init 最前: flag 是纯计数信号, 与 L1/L0 InitBuffer
+            // 等 AIC 侧初始化无依赖; 尽早放行使配对 AIV 提前开始下发 CopyIn
+            CrossCoreSetFlag<SYNC_MODE2, PIPE_FIX>(SYNC_AIC_TO_AIV_FLAG);
+            CrossCoreSetFlag<SYNC_MODE2, PIPE_FIX>(SYNC_AIC_TO_AIV_FLAG);
+        }
+
         xGm.SetGlobalBuffer((__gm__ T *)x);
         hcFnGm.SetGlobalBuffer((__gm__ float *)hcFn);
         workspaceGm.SetGlobalBuffer((__gm__ float *)workspace);
@@ -73,12 +80,6 @@ public:
 
     __aicore__ inline void Process()
     {
-        if ASCEND_IS_AIC{
-            // 初始设置
-            CrossCoreSetFlag<SYNC_MODE2, PIPE_FIX>(SYNC_AIC_TO_AIV_FLAG);
-            CrossCoreSetFlag<SYNC_MODE2, PIPE_FIX>(SYNC_AIC_TO_AIV_FLAG);
-        }
-
         uint64_t curBlockIdx = GetBlockIdx();
         uint64_t curVectorBlockIdx = curBlockIdx;
         if ASCEND_IS_AIV {
