@@ -345,6 +345,41 @@ public:
         InitQueBuffers(stage1UsedCoreNum, xQueNum2);
         InitTBufBuffers(xQueNum2);
         GetLocalTensors();
+        PrepareStage2Consts();
+    }
+
+    // [simopt0914] Part2 循环常量提前计算(纯 tiling 派生, 不依赖 AIC 输出):
+    // 原先在 Process 开头重算, 排在 WaitPeer 之后构成 ~0.2us 标量风暴,
+    // 现随 Init 一起在等待 AIC 的空闲窗口内完成 —— 屏障释放后第一条
+    // 指令即 squareSum CopyIn, 消除 "AIC 最后 FIX -> 首个 MTE2" 的本地开销
+    __aicore__ inline void PrepareStage2Consts()
+    {
+        stage2BlockIdx_ = GetBlockIdx();
+        int64_t stage2UsedCoreNum = tilingData->secondUsedCoreNum;
+        if (stage2BlockIdx_ >= stage2UsedCoreNum) {
+            return;  // idle AIV 不参与 stage2
+        }
+        stage1UsedCoreNum_ = tilingData->cubeBlockDimK;
+        mmLastAxisSize_ = CeilAlign(tilingData->hcMix, MM_CACHE_LINE_BYTES / sizeof(float));
+        int64_t xCastFp32BufSize = tilingData->mL1Size *
+        CeilAlign(tilingData->cvLoopKSize, MM_CACHE_LINE_BYTES / sizeof(float));
+        workspaceSize1_ = tilingData->cubeCoreNum * DOUBLE_BUFFER * xCastFp32BufSize;
+        workspaceSize2_ = CeilAlign(stage1UsedCoreNum_ * tilingData->bs *
+        mmLastAxisSize_ * sizeof(float), WORKSPACE_ALIGN_SIZE) / sizeof(float);
+        rowOuterLoop_ =
+            (stage2BlockIdx_ == stage2UsedCoreNum - 1) ?
+            tilingData->rowLoopOfTailBlock : tilingData->rowLoopOfFormerBlock;
+        tailRowFactor_ = (stage2BlockIdx_ == stage2UsedCoreNum - 1) ? tilingData->tailRowFactorOfTailBlock :
+                                                                        tilingData->tailRowFactorOfFormerBlock;
+        xGmBlockBaseOffsetPart2_ = stage2BlockIdx_ *
+        tilingData->rowOfFormerBlock * tilingData->hcMult * tilingData->d;
+        // [simopt8] comb 批处理: 本核总行数与单批行数
+        rowTotal_ = rowOuterLoop_ * tilingData->stage2RowFactor;
+        combBatchRows_ = rowTotal_ < COMB_BATCH_MAX_ROWS ? rowTotal_ : COMB_BATCH_MAX_ROWS;
+        combCols_ = tilingData->hcMult * tilingData->hcMultAlign;
+        // [simopt8] rsqrtAllLocal 槽步长: RoundUp(rowFactor) 个 float, 保证每行组
+        // 切片基址 32B 对齐(VEC/Brcb 基址对齐要求, 见 InitTBufBuffers 注释)
+        rsqrtSlotStride_ = RoundUp<float>(tilingData->stage2RowFactor);
     }
 
     // [simopt7] AIV 专属预取: hcBase 三个分片的搬运与 MTE2 排空。
@@ -369,44 +404,30 @@ public:
     __aicore__ inline void Process()
     {
         if ASCEND_IS_AIV {
-            int64_t stage1UsedCoreNum = tilingData->cubeBlockDimK;// todo check 此处不应该写死32
-            int64_t stage2BlockIdx = GetBlockIdx();
-            int64_t stage2UsedCoreNum = tilingData->secondUsedCoreNum;
-            if (stage2BlockIdx >= stage2UsedCoreNum) {
+            if (stage2BlockIdx_ >= tilingData->secondUsedCoreNum) {
                 return;
             }
-            int64_t mmLastAxisSize = CeilAlign(tilingData->hcMix, MM_CACHE_LINE_BYTES / sizeof(float));
-            int64_t xCastFp32BufSize = tilingData->mL1Size *
-            CeilAlign(tilingData->cvLoopKSize, MM_CACHE_LINE_BYTES / sizeof(float));
-            int64_t workspaceSize1 = tilingData->cubeCoreNum * DOUBLE_BUFFER * xCastFp32BufSize;
-            int64_t workspaceSize2 = CeilAlign(stage1UsedCoreNum * tilingData->bs *
-            mmLastAxisSize * sizeof(float), WORKSPACE_ALIGN_SIZE) / sizeof(float);
-            // [simopt7] hcBase 搬入 + MTE2 排空已前移至 Prefetch()(在 WaitPeer 之前执行)
-
-            int64_t rowOuterLoop =
-                (stage2BlockIdx == stage2UsedCoreNum - 1) ?
-                tilingData->rowLoopOfTailBlock : tilingData->rowLoopOfFormerBlock;
-            int64_t tailRowFactor = (stage2BlockIdx == stage2UsedCoreNum - 1) ? tilingData->tailRowFactorOfTailBlock :
-                                                                        tilingData->tailRowFactorOfFormerBlock;
-            int64_t xGmBlockBaseOffsetPart2 = stage2BlockIdx *
-            tilingData->rowOfFormerBlock * tilingData->hcMult * tilingData->d;
-            // [simopt8] comb 批处理: 本核总行数与单批行数
-            int64_t rowTotal = rowOuterLoop * tilingData->stage2RowFactor;
-            int64_t combBatchRows = rowTotal < COMB_BATCH_MAX_ROWS ? rowTotal : COMB_BATCH_MAX_ROWS;
-            int64_t combCols = tilingData->hcMult * tilingData->hcMultAlign;
+            // [simopt0914] 循环常量(workspace 偏移/行循环/comb 批参数)已在
+            // Init->PrepareStage2Consts 缓存于等待 AIC 的窗口内, 此处直接进循环
+            int64_t stage2BlockIdx = stage2BlockIdx_;
+            int64_t stage1UsedCoreNum = stage1UsedCoreNum_;
+            int64_t rowOuterLoop = rowOuterLoop_;
+            int64_t tailRowFactor = tailRowFactor_;
+            int64_t rowTotal = rowTotal_;
+            int64_t combBatchRows = combBatchRows_;
+            int64_t combCols = combCols_;
+            int64_t rsqrtSlotStride = rsqrtSlotStride_;
+            int64_t xGmBlockBaseOffsetPart2 = xGmBlockBaseOffsetPart2_;
 
             // ===== loop 1: 每行 squareSum/pre/y/post (与原实现逐行等价,
             // 仅 rsqrt 结果额外写入 rsqrtAllLocal 供 comb 批处理使用) =====
-            // [simopt8] rsqrtAllLocal 槽步长: RoundUp(rowFactor) 个 float, 保证每行组
-            // 切片基址 32B 对齐(VEC/Brcb 基址对齐要求, 见 InitTBufBuffers 注释)
-            int64_t rsqrtSlotStride = RoundUp<float>(tilingData->stage2RowFactor);
             for (int64_t rowOuterIdx = 0; rowOuterIdx < rowOuterLoop; rowOuterIdx++) {
                 int64_t xGmBsBaseOffsetPart2 = rowOuterIdx * tilingData->stage2RowFactor *
                 tilingData->hcMult * tilingData->d;
                 int64_t curRowFactor = (rowOuterIdx == rowOuterLoop - 1) ? tailRowFactor : tilingData->stage2RowFactor;
                 squareSumOutLocal = squareSumQue.AllocTensor<float>();
                 //todo
-                CopyIn(workspaceGm[workspaceSize1 + workspaceSize2 +
+                CopyIn(workspaceGm[workspaceSize1_ + workspaceSize2_ +
                        stage2BlockIdx * tilingData->rowOfFormerBlock * SQUARE_SUM_SIZE +
                        rowOuterIdx * tilingData->stage2RowFactor * SQUARE_SUM_SIZE],
                        squareSumOutLocal, stage1UsedCoreNum, curRowFactor * SQUARE_SUM_SIZE,
@@ -434,7 +455,7 @@ int64_t curBsIdxForAll = (stage2BlockIdx * tilingData->rowLoopOfFormerBlock +
 
                 mixes01Local = mixesQue01.AllocTensor<float>();
 
-                uint64_t mixBaseOffset = workspaceSize1 +
+                uint64_t mixBaseOffset = workspaceSize1_ +
                 stage2BlockIdx * tilingData->rowOfFormerBlock *
                 CeilAlign(tilingData->hcMix, WORKSPACE_ALIGN_SIZE / sizeof(float)) +
                 rowOuterIdx * tilingData->stage2RowFactor *
@@ -500,8 +521,8 @@ int64_t curBsIdxForAll = (stage2BlockIdx * tilingData->rowLoopOfFormerBlock +
             // ×inv_rsdrt 用每行标量 Muls(与原 broadcast Mul 乘同一值, 逐位等价)
             for (int64_t cBase = 0; cBase < rowTotal; cBase += combBatchRows) {
                 int64_t C = (rowTotal - cBase < combBatchRows) ? (rowTotal - cBase) : combBatchRows;
-                int64_t combSrcBase = workspaceSize1 +
-                    stage2BlockIdx * tilingData->rowOfFormerBlock * mmLastAxisSize +
+                int64_t combSrcBase = workspaceSize1_ +
+                    stage2BlockIdx * tilingData->rowOfFormerBlock * mmLastAxisSize_ +
                     tilingData->hcMult * NUM_TWO;
                 for (int64_t i = 0; i < stage1UsedCoreNum; ++i) {
                     mixes2Local = mixesQue2.AllocTensor<float>();
@@ -514,10 +535,10 @@ int64_t curBsIdxForAll = (stage2BlockIdx * tilingData->rowLoopOfFormerBlock +
                         // 目的侧: 16B burst 占 1 个 32B 槽, dstStride 参数按元素计、
                         // helper 内部 /8 转 32B 块 -> 需额外 3 槽间隙 = 24 元素,
                         // 使 burst r 落在槽 j+4r, 即 (C, hcMult, hcMultAlign) 布局
-                        CopyIn(workspaceGm[combSrcBase + i * tilingData->bs * mmLastAxisSize +
-                               cBase * mmLastAxisSize + j * tilingData->hcMult],
+                        CopyIn(workspaceGm[combSrcBase + i * tilingData->bs * mmLastAxisSize_ +
+                               cBase * mmLastAxisSize_ + j * tilingData->hcMult],
                                mixes2Local[j * tilingData->hcMultAlign], C, tilingData->hcMult,
-                               mmLastAxisSize - tilingData->hcMult,
+                               mmLastAxisSize_ - tilingData->hcMult,
                                (tilingData->hcMult - 1) * (BLOCK_SIZE / sizeof(float)));
                     }
                     mixesQue2.EnQue(mixes2Local);
@@ -636,6 +657,20 @@ private:
     TBuf<QuePosition::VECCALC> xCastBuf;
     TBuf<QuePosition::VECCALC> yCastBuf;
     TBuf<QuePosition::VECCALC> maskPatternBuf;
+
+    // [simopt0914] Part2 循环常量缓存(Init->PrepareStage2Consts 在等待 AIC 窗口内算好)
+    int64_t stage2BlockIdx_ = 0;
+    int64_t stage1UsedCoreNum_ = 0;
+    int64_t mmLastAxisSize_ = 0;
+    int64_t workspaceSize1_ = 0;
+    int64_t workspaceSize2_ = 0;
+    int64_t rowOuterLoop_ = 0;
+    int64_t tailRowFactor_ = 0;
+    int64_t xGmBlockBaseOffsetPart2_ = 0;
+    int64_t rowTotal_ = 0;
+    int64_t combBatchRows_ = 0;
+    int64_t combCols_ = 0;
+    int64_t rsqrtSlotStride_ = 0;
 
     LocalTensor<float> mixes01Local;
     LocalTensor<float> mixes2Local;
