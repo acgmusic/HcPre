@@ -12,6 +12,10 @@
 #   bash run.sh board  [b] [bs]                   # 上板跑精度用例并对比 golden
 #   bash run.sh sim    [b] [bs]                   # msprof 仿真(精度对比内嵌)
 #   bash run.sh perf   [b] [bs]                   # 上板 msprof 性能, 打印 Task Duration + op_summary csv 路径
+#   bash run.sh perf   test_shapes.csv [iters]    # 多 shape 批量: 一次 msprof 跑完 csv 全部 shape
+#                                                 #   (csv: 表头 b,bs[,d], '#' 注释; 默认 50 轮,
+#                                                 #    外层轮次内层 shape; 输出 perf_out_multi/:
+#                                                 #    汇总 + 每 shape 单行文件, 兼容 perf_extreme_eval)
 #   bash run.sh all    [--debug|--release] [b] [bs]
 #
 # 环境变量:
@@ -276,6 +280,60 @@ EOS
 }
 
 # ---------------------------------------------------------------------------
+# 4b. 上板性能 (多 shape 批量: 一次 msprof 跑完 csv 内全部 shape)
+# ---------------------------------------------------------------------------
+do_perf_multi() {
+  SHAPES_CSV_ARG=${POS_B:?}
+  ITERS_MULTI=${POS_BS:-$ITERS}
+
+  # 解析为绝对路径(依次尝试: 当前目录 / 工程根 / 脚本目录), 并要求位于工程内
+  # (docker 模式需随 sync_repo 进容器)
+  SHAPES_ABS=""
+  for _cand in "$PWD/$SHAPES_CSV_ARG" "$WS/$SHAPES_CSV_ARG" "$SCRIPT_DIR/$SHAPES_CSV_ARG"; do
+    [ -f "$_cand" ] && { SHAPES_ABS="$_cand"; break; }
+  done
+  [ -n "$SHAPES_ABS" ] || die "shapes csv not found: $SHAPES_CSV_ARG (tried \$PWD, $WS, $SCRIPT_DIR)"
+  SHAPES_REL=${SHAPES_ABS#"$WS"/}
+  [ "$SHAPES_REL" != "$SHAPES_ABS" ] || die "shapes csv must live under $WS (got $SHAPES_ABS)"
+
+  if [ "$C" != "none" ]; then
+    bash "$SCRIPT_DIR/../sync_repo.sh" >/dev/null
+  fi
+  LWS=$([ "$C" = "none" ] && echo "$WS" || echo "$C_WS")
+  LREPO=$LWS/vllm-ascend
+  LENVSH=$LWS/scripts/container_env.sh
+  LVENDOR=$LREPO/vllm_ascend/_cann_ops_custom/vendors/custom_transformer
+  LSHAPES=$LWS/$SHAPES_REL
+
+  step "board performance multi-shape (csv=$SHAPES_REL, iters=$ITERS_MULTI, npu=$NPU_ID) [mode=$C]"
+  xec <<EOS
+set -e
+source $LENVSH
+which msprof >/dev/null 2>&1 || { echo "msprof not found"; exit 1; }
+export ASCEND_CUSTOM_OPP_PATH=$LVENDOR
+PYBIND_SO=\$(ls $LREPO/vllm_ascend/vllm_ascend_C*.so | head -1)
+export HC_PRE_PYBIND_SO=\$PYBIND_SO
+export LD_LIBRARY_PATH="\$(dirname "\$PYBIND_SO"):\${LD_LIBRARY_PATH:-}"
+export HC_PRE_SHAPES=$LSHAPES
+export HC_PRE_ITERS=$ITERS_MULTI
+export HC_PRE_COMPARE=0
+export NPU_ID=$NPU_ID
+rm -rf $LWS/perf_out_multi; mkdir -p $LWS/perf_out_multi
+msprof --application="python3 $LWS/scripts/hc_pre/hcpre_sim_app.py" \\
+  --output=$LWS/perf_out_multi \\
+  --aic-metrics=PipeUtilization 2>&1 | tail -5 || true
+echo
+echo "=== op_summary csv ==="
+CSV=\$(find $LWS/perf_out_multi -name "op_summary_*.csv" | head -1)
+if [ -n "\$CSV" ]; then
+  python3 $LWS/scripts/perf_stats_multi.py "\$CSV" "$LSHAPES" $LWS/perf_out_multi HcPre || true
+else
+  echo "(no op_summary csv found)"
+fi
+EOS
+}
+
+# ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
 CMD=${1:-}
@@ -295,7 +353,12 @@ case "$CMD" in
   build) do_build ;;
   board) do_board ;;
   sim)   do_sim ;;
-  perf)  do_perf ;;
+  perf)
+    case "${POS_B:-}" in
+      *.csv) do_perf_multi ;;
+      *)     do_perf ;;
+    esac
+    ;;
   all)
     do_build
     do_board || echo "(board skipped/failed - no NPU?)"
