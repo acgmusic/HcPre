@@ -13,22 +13,28 @@ Env:
   HC_PRE_COMPARE     "1" (default) to compare against CPU golden
   NPU_ID             device index used for on-board runs (default 0)
   HC_PRE_ITERS       number of op launches per run (default 1; perf uses 50)
-  HC_PRE_SHAPES      multi-shape mode: a shapes csv path, or "auto" to generate
-                     HC_PRE_VERIFY_COUNT (default 1000) random shapes with
-                     HC_PRE_VERIFY_SEED (default 1024): b ∈ [1,4] uniform,
-                     s log-uniform in [1,8192], d fixed 4096. csv format:
-                     header "b,bs|s[,d|hidden]" ('#'-comments; d default 4096).
-                     With HC_PRE_COMPARE=1 this runs the generalization
-                     accuracy sweep: each shape is launched once and compared
-                     against the CPU golden; the FIRST failure stops the run
-                     (exit 1) with a detailed report; set HC_PRE_DUMP to also
-                     save the failing shape's inputs/outputs. With
-                     HC_PRE_COMPARE=0 it is the perf mode: PERF_ITERS passes
-                     over all shapes (iter-major), no compare/dump.
+  HC_PRE_SHAPES      multi-shape mode: a shapes csv path, or "auto[:N][:BMAX]" to
+                     generate N random shapes with HC_PRE_VERIFY_SEED (default 1024):
+                     b ∈ [1,BMAX] uniform (default 4, HC_PRE_VERIFY_BMAX), s log-uniform
+                     in [1,SMAX] (default 8192, HC_PRE_VERIFY_SMAX), d fixed 4096.
+                     N defaults to HC_PRE_VERIFY_COUNT (1000). BMAX/SMAX cap the
+                     per-shape workload (sim Model RUN TIME ~ linear in b*s*d) so a
+                     bounded sweep can finish within a time budget, e.g. in the
+                     simulator. csv format: header "b,bs|s[,d|hidden]" ('#'-comments;
+                     d default 4096). With HC_PRE_COMPARE=1 this runs the
+                     generalization accuracy sweep: each shape is launched once and
+                     compared against the CPU golden; the FIRST failure stops the run
+                     (exit 1) with a detailed report; set HC_PRE_DUMP to also save
+                     the failing shape's inputs/outputs. With HC_PRE_COMPARE=0 it is
+                     the perf mode: PERF_ITERS passes over all shapes (iter-major),
+                     no compare/dump.
   HC_PRE_VERIFY_COUNT  shapes to generate in "auto" mode (default 1000)
   HC_PRE_VERIFY_SEED   shape-generation seed for "auto" mode (default 1024)
+  HC_PRE_VERIFY_BMAX   max b in "auto" mode (default 4)
+  HC_PRE_VERIFY_SMAX   max s in "auto" mode (default 8192)
 """
 
+import math
 import os
 import random
 import sys
@@ -47,6 +53,8 @@ PERF_ITERS = max(1, int((os.environ.get("HC_PRE_ITERS") or "").strip() or 1))
 HC_PRE_SHAPES = (os.environ.get("HC_PRE_SHAPES") or "").strip()
 HC_PRE_VERIFY_COUNT = max(1, int((os.environ.get("HC_PRE_VERIFY_COUNT") or "").strip() or 1000))
 HC_PRE_VERIFY_SEED = int((os.environ.get("HC_PRE_VERIFY_SEED") or "").strip() or 1024)
+HC_PRE_VERIFY_BMAX = max(1, int((os.environ.get("HC_PRE_VERIFY_BMAX") or "").strip() or 4))
+HC_PRE_VERIFY_SMAX = max(1, int((os.environ.get("HC_PRE_VERIFY_SMAX") or "").strip() or 8192))
 
 HC_MULT = 4
 HIDDEN_SIZE = 4096
@@ -110,16 +118,25 @@ def _parse_shapes_csv(path):
     return shapes
 
 
-def _gen_shapes(count, seed):
-    """固定种子的随机 shape 生成(泛化精度验证): b ∈ [1,4] 均匀, s 对数均匀 [1,8192]
-    (等权覆盖每个倍频程, 与手工扫描清单 1,2,4,...,8970 的分布一致), d 固定 4096。
-    保证 count 个互不相同的 (b, s, d)。"""
+def _gen_shapes(count, seed, b_max=4, s_max=8192):
+    """固定种子的随机 shape 生成(泛化精度验证): b ∈ [1,b_max] 均匀, s 对数均匀
+    [1,s_max] (等权覆盖每个倍频程, 与手工扫描清单 1,2,4,...,8970 的分布一致),
+    d 固定 4096。保证 count 个互不相同的 (b, s, d)。
+    b_max/s_max 可由 HC_PRE_VERIFY_BMAX / HC_PRE_VERIFY_SMAX 收紧, 用于把
+    仿真工作量压到可承受范围(bs_total = b*s ≤ b_max*s_max, Model RUN TIME
+    与 bs_total×d 大致线性)。"""
+    if b_max < 1 or s_max < 1:
+        raise ValueError(f"[sim-app] b_max/s_max must be >= 1, got {b_max}/{s_max}")
+    if b_max * s_max < count:
+        raise ValueError(f"[sim-app] cannot draw {count} distinct shapes from "
+                         f"b∈[1,{b_max}] x s∈[1,{s_max}] (only {b_max * s_max} combos)")
+    s_log2 = math.log2(s_max)
     rng = random.Random(seed)
     seen = set()
     shapes = []
     while len(shapes) < count:
-        b = rng.randint(1, 4)
-        s = max(1, min(8192, int(2 ** rng.uniform(0.0, 13.0))))
+        b = rng.randint(1, b_max)
+        s = max(1, min(s_max, int(2 ** rng.uniform(0.0, s_log2))))
         if (b, s) in seen:
             continue
         seen.add((b, s))
@@ -128,12 +145,15 @@ def _gen_shapes(count, seed):
 
 
 def _load_shapes(spec):
-    """HC_PRE_SHAPES 取值解析: 'auto[:N]' -> 随机生成; 其它 -> shapes csv 路径"""
+    """HC_PRE_SHAPES 取值解析: 'auto[:N][:b_max][:s_max]' -> 随机生成(各段可
+    独立省略, 缺省取 HC_PRE_VERIFY_COUNT / HC_PRE_VERIFY_BMAX /
+    HC_PRE_VERIFY_SMAX); 其它 -> shapes csv 路径"""
     if spec == "auto" or spec.startswith("auto:"):
-        count = HC_PRE_VERIFY_COUNT
-        if spec.startswith("auto:"):
-            count = max(1, int(spec[5:]))
-        return _gen_shapes(count, HC_PRE_VERIFY_SEED)
+        parts = spec.split(":", 2)
+        count = int(parts[1]) if len(parts) > 1 and parts[1] else HC_PRE_VERIFY_COUNT
+        b_max = int(parts[2]) if len(parts) > 2 and parts[2] else HC_PRE_VERIFY_BMAX
+        s_max = HC_PRE_VERIFY_SMAX
+        return _gen_shapes(max(1, count), HC_PRE_VERIFY_SEED, max(1, b_max), max(1, s_max))
     return _parse_shapes_csv(spec)
 
 

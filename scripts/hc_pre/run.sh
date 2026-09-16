@@ -10,10 +10,16 @@
 # 用法:
 #   bash run.sh build  [--debug|--release]        # 编译+安装算子包+pybind(默认 release)
 #   bash run.sh board  [b] [bs]                   # 上板跑精度用例并对比 golden
-#   bash run.sh verify [N | shapes.csv]           # 上板泛化精度验证: N 个随机 shape
-#                                                 #   (默认 1000, b∈[1,4] 均匀 / s 对数均匀
-#                                                 #   [1,8192] / d=4096, 固定种子
+#   bash run.sh verify [N | shapes.csv] [--bmax=B] [--smax=S]
+#                                                 # 上板泛化精度验证: N 个随机 shape
+#                                                 #   (默认 1000, b∈[1,B] 均匀 / s 对数均匀
+#                                                 #   [1,S] / d=4096, 固定种子
 #                                                 #   HC_PRE_VERIFY_SEED=1024) 或 csv 指定;
+#                                                 #   --bmax/--smax(或环境变量
+#                                                 #   HC_PRE_VERIFY_BMAX/SMAX) 收紧 b/s 上限,
+#                                                 #   把单 shape 仿真工作量压进时间预算
+#                                                 #   (bs_total=b*s, Model RUN TIME 与
+#                                                 #   bs_total*d 大致线性, 供小 shape 复现);
 #                                                 #   逐 shape 比对 golden, 首个 FAIL 立即停止
 #                                                 #   并报告(设 HC_PRE_DUMP=path 可落盘失败现场)
 #   bash run.sh sim    [b] [bs]                   # msprof 仿真(精度对比内嵌)
@@ -236,6 +242,22 @@ do_verify() {
     esac
   fi
   [ -z "$VCSV" ] || [ -z "$VCNT" ] || die "verify: give either a count or a csv, not both"
+  # --bmax/--smax 收紧随机 shape 的 b/s 上限(控制仿真工作量; 仅 auto 模式有效)
+  VBMAX=${HC_PRE_VERIFY_BMAX:-4}
+  VSMAX=${HC_PRE_VERIFY_SMAX:-8192}
+  for _a in ${VERIFY_OPTS:-}; do
+    case "$_a" in
+      --bmax=*) VBMAX="${_a#--bmax=}" ;;
+      --smax=*) VSMAX="${_a#--smax=}" ;;
+      *) die "verify: unknown option '$_a' (supported: --bmax=N --smax=N)" ;;
+    esac
+  done
+  case "$VBMAX$VSMAX" in
+    ''|*[!0-9]*) die "verify: --bmax/--smax must be positive integers" ;;
+  esac
+  [ "$VBMAX" -ge 1 ] && [ "$VSMAX" -ge 1 ] || die "verify: --bmax/--smax must be >= 1"
+  [ -z "$VCSV" ] || [ "$VBMAX$VSMAX" = "48192" ] || \
+    echo "verify: NOTE --bmax/--smax ignored in csv mode"
 
   if [ "$C" != "none" ]; then
     bash "$SCRIPT_DIR/../sync_repo.sh" >/dev/null
@@ -264,7 +286,7 @@ do_verify() {
     VDESC="csv=$VREL"
   else
     LSHAPES="auto"
-    VDESC="auto count=${VCNT:-1000} seed=${HC_PRE_VERIFY_SEED:-1024}"
+    VDESC="auto count=${VCNT:-1000} seed=${HC_PRE_VERIFY_SEED:-1024} bmax=$VBMAX smax=$VSMAX"
   fi
 
   step "board generalization accuracy verify ($VDESC, npu=$NPU_ID) [mode=$C]"
@@ -278,6 +300,8 @@ export LD_LIBRARY_PATH="\$(dirname "\$PYBIND_SO"):\${LD_LIBRARY_PATH:-}"
 export HC_PRE_SHAPES=$LSHAPES
 export HC_PRE_VERIFY_COUNT=${VCNT:-1000}
 export HC_PRE_VERIFY_SEED=${HC_PRE_VERIFY_SEED:-1024}
+export HC_PRE_VERIFY_BMAX=$VBMAX
+export HC_PRE_VERIFY_SMAX=$VSMAX
 export HC_PRE_COMPARE=1
 export NPU_ID=$NPU_ID
 export HC_PRE_DUMP=${HC_PRE_DUMP:-}
@@ -462,14 +486,19 @@ EOS
 # ---------------------------------------------------------------------------
 CMD=${1:-}
 shift || true
+VERIFY_OPTS=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --debug)   MODE=debug ;;
     --release) MODE=release ;;
+    --bmax=*|--smax=*)
+      # verify 专用: 收集随机 shape 的 b/s 上限, 由 do_verify 消费
+      VERIFY_OPTS="$VERIFY_OPTS $1" ;;
     *) if [ -z "${POS_B:-}" ]; then POS_B=$1; else POS_BS=$1; fi ;;
   esac
   shift
 done
+export VERIFY_OPTS
 B=${POS_B:-$B}
 BS=${POS_BS:-$BS}
 
